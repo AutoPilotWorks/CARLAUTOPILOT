@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Data, models, results (stay outside Git)
+data/
+datasets/
+runs/
+outputs/
+logs/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+*.h5
+*.tar
+*.zip
+*.mp4
+*.avi
+
+# CARLA binaries and caches
+CARLA_*/
+CarlaUE4/
+Unreal/
+
+# Local notes and editors
+HANDOFF.md
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
