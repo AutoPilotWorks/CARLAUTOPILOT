@@ -85,10 +85,11 @@
 - **조향 부호:** CARLA `VehicleControl.steer` 양수가 우회전이라 프로젝트 규약과 같다(steer=+0.5에서 yaw 0.2°→16.3°). 좌표는 CARLA가 왼손 좌표계(y가 오른쪽)라 `y`와 `yaw` 부호를 뒤집어 프로젝트 좌표로 바꾼다(`route.carla_to_xy`, `carla_yaw_to_rad`).
 - **차량:** `vehicle.lincoln.mkz_2020`, 축거 2.86 m, 앞바퀴 최대 조향각 70°(조향 1.0 = 70°). 전문가의 순수 추종에 이 값을 쓴다.
 - **동기 모드:** `fixed_delta_seconds = 0.05`, `world.tick()`마다 카메라(256×128, FOV 90, 차 앞 1.5 m·높이 1.6 m) 프레임 번호를 맞춰 받는다. Traffic Manager도 동기 모드로 둔다.
-- **경로:** CARLA 패키지의 `agents.navigation.GlobalRoutePlanner`(2 m 간격, `networkx` 필요, `--carla-root`로 경로 지정)로 출발점→도착점 경로를 만든다. 교차로 구간의 `RoadOption`(LEFT/RIGHT/STRAIGHT)을 교차로 10 m 앞부터 명령으로 주고, 교차로를 지나면 FOLLOW. 자기 경로 근처를 다시 지나는 경로 때문에 진행 거리 투영은 현재 위치 주변 구간으로 제한한다(`WindowedRoute`).
+- **경로:** 차로 변경(`CHANGELANELEFT/RIGHT`)이 들어간 경로는 버린다(모델에 차로 변경 명령이 없어서). CARLA 패키지의 `agents.navigation.GlobalRoutePlanner`(2 m 간격, `networkx` 필요, `--carla-root`로 경로 지정)로 출발점→도착점 경로를 만든다. 교차로 구간의 `RoadOption`(LEFT/RIGHT/STRAIGHT)을 교차로 10 m 앞부터 명령으로 주고, 교차로를 지나면 FOLLOW. 자기 경로 근처를 다시 지나는 경로 때문에 진행 거리 투영은 현재 위치 주변 구간으로 제한한다(`WindowedRoute`).
 - **앞 장애물:** 경로 복도(중심선 좌우 1.8 m) 안의 차량·보행자 중 가장 가까운 것의 차체 간 거리와 경로 방향 상대 속도. 시뮬레이터의 정답 위치로 계산하므로 레이더 같은 센서를 흉내 낸 **특권 정보**다.
 - **신호등:** 각 신호등의 정지 웨이포인트가 경로 위(2 m 이내, 방향 30° 이내)에 있으면 그 진행 거리를 정지선으로 쓴다. 빨간불에 0.5 m/s 초과로 정지선을 넘으면 `red_light`. 전문가는 빨간불과 노란불에서 선다.
 - **종료:** 충돌 센서의 모든 충돌(차량·보행자·고정물), 횡오차 2 m 초과 2초(`off_route`), 0.1 m/s 미만 **90초**(`blocked`, CARLA 신호 대기가 30초를 넘는 일이 있어서 FakeEnv의 30초보다 길게), 경로 끝 2 m 전 도달(`route_complete`), 시간 초과(경로 길이/속도×3+120초).
 - **보조 카메라(`extra_views`):** (왼쪽 거리 m, 왼쪽 회전 °) 목록. 수집 때 각 카메라 영상에 "차가 그 위치·방향에 있었다면 전문가가 냈을 조향"을 라벨로 붙인다(`route.points_seen_from`로 앞쪽 경로점을 옮겨 다시 계산). 페달 라벨은 중앙 카메라와 같다.
+- **관전 시점(`follow_spectator`, 기본 켜짐):** CARLA 창의 관전자 카메라를 매 틱 우리 차 뒤 8 m·위 4 m에서 15° 내려다보게 옮긴다. 학습용 카메라와 별개라 데이터에 영향이 없다.
 - **맵 전환:** 같은 프로세스에서 `load_world`를 하면 클라이언트가 간헐적으로 강제 종료됐다(`_episode != nullptr` assert, Simulator.h). 그래서 `switch_map()`이 별도 프로세스에서 맵을 바꾸고, 수집·평가 명령은 한 번에 도시 하나만 다룬다.
-- **명령줄:** `python -m carlautopilot.cli.carla_run collect|eval --carla-root <CARLA 폴더> --town <도시> ...`. 수집은 전문가(`PathFollowPolicy`, 회전 감속 `max_lat_accel=2.0`, ACC 최소 간격 4 m)에 조향 잡음(기본 0.05)을 넣어 달리고 깨끗한 전문가 행동을 라벨로 저장한다. 평가는 `--checkpoint`가 없으면 전문가, 있으면 모델(`--model-pedals`가 없으면 페달은 ACC)을 `run_suite`로 돌린다.
+- **명령줄:** `python -m carlautopilot.cli.carla_run collect|eval --carla-root <CARLA 폴더> --town <도시> ...`. 수집은 전문가(`PathFollowPolicy`, 회전 감속 `max_lat_accel=2.0`, ACC 최소 간격 4 m)에 조향 잡음(기본 0.05)을 넣어 달리고 깨끗한 전문가 행동을 라벨로 저장한다. 평가는 `--checkpoint`가 없으면 전문가, 있으면 모델(`--model-pedals`가 없으면 페달은 ACC, 기본 속도 6 m/s, 교차로 명령 중 4.5 m/s 규칙)을 `run_suite`로 돌린다.

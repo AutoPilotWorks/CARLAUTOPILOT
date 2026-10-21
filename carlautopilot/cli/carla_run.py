@@ -81,7 +81,7 @@ def evaluate(a: argparse.Namespace, env: CarlaEnv) -> None:
     else:
         from carlautopilot.policies.model_policy import ModelPolicy
 
-        factory = lambda: ModelPolicy.from_checkpoint(a.checkpoint, speed_limit_mps=a.speed, use_model_pedals=a.model_pedals, acc=ACC, device=a.device)
+        factory = lambda: ModelPolicy.from_checkpoint(a.checkpoint, speed_limit_mps=a.model_speed, use_model_pedals=a.model_pedals, acc=ACC, turn_speed_mps=a.turn_speed, device=a.device)
         title = f"CARLA {a.town}: model {'steer+pedals' if a.model_pedals else 'steer, ACC pedals'}"
     res = run_suite(lambda: env, factory, scs, a.out_dir, title=title)
     print(json.dumps(res["aggregate"], ensure_ascii=False))
@@ -110,6 +110,8 @@ def main(argv: list[str] | None = None) -> None:
     e.add_argument("--out-dir", required=True)
     e.add_argument("--checkpoint")
     e.add_argument("--model-pedals", action="store_true")
+    e.add_argument("--model-speed", type=float, default=6.0, help="ACC speed limit for the model (expert data rarely exceeds ~5-6 m/s)")
+    e.add_argument("--turn-speed", type=float, default=4.5, help="ACC speed cap while the command is LEFT/RIGHT/STRAIGHT (rule)")
     e.add_argument("--device", default="cuda", choices=["cpu", "cuda"])
     a = p.parse_args(argv)
     switch_map(a.town, a.host, a.port)

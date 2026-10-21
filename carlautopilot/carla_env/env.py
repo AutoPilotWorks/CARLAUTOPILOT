@@ -11,7 +11,7 @@ from pathlib import Path
 import carla
 import numpy as np
 
-from carlautopilot.carla_env.route import WindowedRoute, carla_to_xy, carla_yaw_to_rad, commands_from_options, dedupe_points
+from carlautopilot.carla_env.route import LANE_CHANGE_OPTIONS, WindowedRoute, carla_to_xy, carla_yaw_to_rad, commands_from_options, dedupe_points
 from carlautopilot.core import Action, Command, Event, EventKind, GroundTruth, LeadInfo, Observation, StepResult
 from carlautopilot.scenario import RouteCommand, ScenarioSpec, Waypoint
 from carlautopilot.sim.fake_env import (
@@ -78,10 +78,12 @@ class CarlaEnv:
         privileged_obs: bool = False,
         timeout_s: float = 60.0,
         extra_views: tuple[tuple[float, float], ...] = (),
+        follow_spectator: bool = True,
     ):
         """extra_views: additional cameras as (offset left m, yaw left deg); their images go to extras["view_images"]."""
         self.dt = dt
         self.extra_views = tuple(extra_views)
+        self.follow_spectator = follow_spectator
         self.image_size = image_size
         self.render_images = render_images
         self.privileged_obs = privileged_obs
@@ -120,7 +122,7 @@ class CarlaEnv:
         max_len_m: float = 600.0,
         npc_vehicles: int = 30,
         speed_limit_mps: float = 8.0,
-        max_tries: int = 50,
+        max_tries: int = 200,
     ) -> ScenarioSpec:
         """Random A->B route from CARLA's GlobalRoutePlanner, with junction commands."""
         _load_agents(carla_root)
@@ -132,6 +134,8 @@ class CarlaEnv:
         for _ in range(max_tries):
             a, b = rng.sample(spawns, 2)
             trace = grp.trace_route(a.location, b.location)
+            if any(int(opt) in LANE_CHANGE_OPTIONS for _, opt in trace):
+                continue
             pts = [carla_to_xy(wp.transform.location.x, wp.transform.location.y) for wp, _ in trace]
             keep = dedupe_points(pts)
             pts = [pts[i] for i in keep]
@@ -248,8 +252,15 @@ class CarlaEnv:
         if images:
             self._last_image, self._view_images = images[0], images[1:]
 
+    def _follow(self, tr) -> None:
+        back = tr.get_forward_vector()
+        loc = tr.location - carla.Location(x=back.x * 8.0, y=back.y * 8.0) + carla.Location(z=4.0)
+        self.world.get_spectator().set_transform(carla.Transform(loc, carla.Rotation(pitch=-15.0, yaw=tr.rotation.yaw)))
+
     def _update_pose(self) -> None:
         tr = self._ego.get_transform()
+        if self.follow_spectator:
+            self._follow(tr)
         vel = self._ego.get_velocity()
         self.x, self.y = carla_to_xy(tr.location.x, tr.location.y)
         self.yaw = carla_yaw_to_rad(tr.rotation.yaw)

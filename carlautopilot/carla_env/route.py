@@ -12,6 +12,7 @@ from carlautopilot.scenario import RouteCommand
 
 # agents.navigation.local_planner.RoadOption values
 ROAD_OPTION_TO_COMMAND = {1: Command.LEFT, 2: Command.RIGHT, 3: Command.STRAIGHT}
+LANE_CHANGE_OPTIONS = {5, 6}  # CHANGELANELEFT/RIGHT: no route command for these yet
 COMMAND_LEAD_M = 10.0
 
 
