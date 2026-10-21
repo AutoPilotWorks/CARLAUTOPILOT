@@ -43,8 +43,10 @@ class ACCController:
             return idm.accel(obs.speed_mps)
         return idm.accel(obs.speed_mps, obs.lead.distance_m, -obs.lead.rel_speed_mps)
 
-    def act(self, obs: Observation, speed_limit: float) -> tuple[float, float]:
-        a = self.accel(obs, speed_limit)
+    def pedals(self, a: float) -> tuple[float, float]:
         if a >= 0:
             return min(1.0, a / self.idm.a_max), 0.0
         return 0.0, min(1.0, -a / self.max_brake_decel)
+
+    def act(self, obs: Observation, speed_limit: float) -> tuple[float, float]:
+        return self.pedals(self.accel(obs, speed_limit))

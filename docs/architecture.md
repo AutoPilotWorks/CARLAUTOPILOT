@@ -22,7 +22,7 @@ CARLA 없이 먼저 만들 수 있는 부분의 설계입니다. **CARLA 연결 
 첫 줄은 `EpisodeHeader`(`scenario_name`, `seed`, `dt`, `policy_name`, `schema_version`), 이후 한 줄에 `StepRecord` 하나(`step`, `t`, `speed_mps`, `command`, `action`, `truth`, `events`, `lead_distance_m`). 쓰기와 읽기는 `carlautopilot/eval/episode_log.py`가 맡는다.
 
 ## 평가 지표 (프로젝트 정의, CARLA 리더보드 값이 아님)
-- `route_completion` = clamp(최대 `route_progress_m` / `route_length_m`, 0, 1).
+- `route_completion` = clamp(최대 `route_progress_m` / `route_length_m`, 0, 1). 환경이 `route_complete`로 종료한 에피소드는 정확히 1.0으로 본다(환경이 경로 끝 근처의 허용 오차 안에서 완주로 판정하기 때문).
 - 사건별 감점 계수(설정 가능, 기본값): collision_vehicle 0.6, collision_pedestrian 0.5, collision_static 0.65, red_light 0.7, stop_sign 0.8, off_road 0.8, lane_departure 0.95, route_deviation 0.8, blocked 0.9.
 - `driving_score` = `route_completion` × (사건 하나당 계수의 곱).
 - `success` = `termination == "route_complete"`이고 충돌 사건이 없다.

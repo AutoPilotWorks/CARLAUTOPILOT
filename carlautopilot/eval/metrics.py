@@ -25,6 +25,9 @@ def compute_metrics(
 ) -> dict:
     """Per-episode metrics.
 
+    route_completion is max progress / route length, but exactly 1.0 when the environment ended the
+    episode as route_complete (the environment accepts the end of the route within a small margin).
+
     max_decel_mps2: largest speed drop per second between consecutive records (dt = header.dt).
     mean_abs_jerk: mean |d(accel)/dt| where accel is the speed difference over dt.
     """
@@ -36,6 +39,8 @@ def compute_metrics(
     length = records[0].truth.route_length_m
     progress = max(r.truth.route_progress_m for r in records)
     completion = min(1.0, max(0.0, progress / length)) if length > 0 else 0.0
+    if termination == "route_complete":
+        completion = 1.0
     counts: Counter[str] = Counter(e.kind for r in records for e in r.events)
     factor = 1.0
     for kind, n in counts.items():

@@ -64,6 +64,12 @@ def test_full_completion_score_one():
     assert m["route_completion"] == 1.0 and m["driving_score"] == 1.0 and m["success"] is True
 
 
+def test_route_complete_termination_counts_as_full_completion():
+    recs = [rec(i, 5.0, i * 24.9) for i in range(5)]
+    assert compute_metrics(HEADER, recs, "timeout")["route_completion"] == pytest.approx(0.996)
+    assert compute_metrics(HEADER, recs, "route_complete")["route_completion"] == 1.0
+
+
 def test_half_progress():
     recs = [rec(i, 5.0, i * 12.5) for i in range(5)]
     m = compute_metrics(HEADER, recs, "timeout")
