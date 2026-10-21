@@ -85,8 +85,51 @@ def stop_sign(length_m: float = 300.0, sign_s_m: float = 120.0, name: str = "sto
     )
 
 
+def compose(segments: list[tuple], name: str = "composed", speed_limit_mps: float = 13.9, **kw) -> ScenarioSpec:
+    """Chain ("straight", length_m) and ("left"|"right", radius_m, angle_deg) segments into one route with turn commands."""
+    x = y = heading = s = 0.0
+    pts = [Waypoint(0.0, 0.0)]
+    cmds = [RouteCommand(0.0, Command.STRAIGHT)]
+    for seg in segments:
+        if seg[0] == "straight":
+            pts += _line(x, y, heading, seg[1])[1:]
+            x, y, s = pts[-1].x, pts[-1].y, s + seg[1]
+            continue
+        direction, radius, angle = seg
+        if direction not in ("left", "right"):
+            raise ValueError(f"unknown segment {direction}")
+        sign = 1.0 if direction == "left" else -1.0
+        cmds.append(RouteCommand(max(s - 10.0, cmds[-1].s_m), Command.LEFT if sign > 0 else Command.RIGHT))
+        nx, ny = -math.sin(heading), math.cos(heading)
+        cx, cy = x + sign * radius * nx, y + sign * radius * ny
+        vx, vy = x - cx, y - cy
+        steps = max(4, int(math.radians(angle) * radius / SPACING_M))
+        for i in range(1, steps + 1):
+            th = sign * math.radians(angle) * i / steps
+            pts.append(Waypoint(cx + vx * math.cos(th) - vy * math.sin(th), cy + vx * math.sin(th) + vy * math.cos(th)))
+        x, y = pts[-1].x, pts[-1].y
+        heading += sign * math.radians(angle)
+        s += math.radians(angle) * radius
+        cmds.append(RouteCommand(s, Command.STRAIGHT))
+    return ScenarioSpec(name=name, route=tuple(pts), commands=tuple(cmds), speed_limit_mps=speed_limit_mps, **kw)
+
+
+def delivery_route(name: str = "delivery_route") -> ScenarioSpec:
+    """Simulated mini delivery: three turns, a red light, a stop sign and a slow lead vehicle."""
+    return compose(
+        [("straight", 150.0), ("right", 40.0, 90.0), ("straight", 120.0), ("left", 40.0, 90.0), ("straight", 100.0), ("left", 40.0, 90.0), ("straight", 150.0)],
+        name=name,
+        lights=(TrafficLightSpec(100.0, red_s=20.0, green_s=60.0),),
+        stop_signs=(StopSignSpec(300.0),),
+        lead=LeadVehicleSpec(60.0, ((0.0, 9.0),)),
+        max_time_s=200.0,
+        meta={"initial_speed_mps": 6.0},
+        tags=("route", "full"),
+    )
+
+
 def standard_suite() -> list[ScenarioSpec]:
-    return [straight(), curve("left"), curve("right"), lead_brake(), red_light(), pedestrian_crossing(), stop_sign()]
+    return [straight(), curve("left"), curve("right"), lead_brake(), red_light(), pedestrian_crossing(), stop_sign(), delivery_route()]
 
 
 def random_scenarios(n: int, seed: int = 0, families: tuple[str, ...] = ("straight", "curve", "lead_brake")) -> list[ScenarioSpec]:
@@ -125,6 +168,16 @@ def random_scenarios(n: int, seed: int = 0, families: tuple[str, ...] = ("straig
                 )
             )
             continue
+        elif family == "red_light":
+            sc = red_light(rng.uniform(250.0, 350.0), rng.uniform(80.0, 150.0), name=name)
+        elif family == "stop_sign":
+            sc = stop_sign(rng.uniform(250.0, 350.0), rng.uniform(80.0, 150.0), name=name)
+        elif family == "route":
+            segs: list[tuple] = [("straight", rng.uniform(80.0, 150.0))]
+            for _ in range(rng.randint(2, 4)):
+                segs.append((rng.choice(["left", "right"]), rng.uniform(30.0, 50.0), rng.choice([60.0, 90.0])))
+                segs.append(("straight", rng.uniform(60.0, 120.0)))
+            sc = compose(segs, name=name, max_time_s=250.0, meta={"initial_speed_mps": 6.0}, tags=("route",))
         else:
             raise ValueError(f"unknown family {family}")
         out.append(ScenarioSpec(**{**sc.__dict__, "seed": i}))
