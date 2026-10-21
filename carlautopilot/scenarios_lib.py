@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 
 from carlautopilot.core import Command
-from carlautopilot.scenario import LeadVehicleSpec, RouteCommand, ScenarioSpec, TrafficLightSpec, Waypoint
+from carlautopilot.scenario import LeadVehicleSpec, PedestrianSpec, RouteCommand, ScenarioSpec, StopSignSpec, TrafficLightSpec, Waypoint
 
 SPACING_M = 2.0
 
@@ -63,8 +63,30 @@ def red_light(length_m: float = 300.0, light_s_m: float = 120.0, name: str = "re
     )
 
 
+def pedestrian_crossing(length_m: float = 300.0, ped_s_m: float = 150.0, start_t_s: float = 9.5, name: str = "pedestrian_crossing") -> ScenarioSpec:
+    return ScenarioSpec(
+        name=name,
+        route=tuple(_line(0.0, 0.0, 0.0, length_m)),
+        pedestrians=(PedestrianSpec(ped_s_m, lateral_start_m=3.5, speed_mps=1.4, start_t_s=start_t_s),),
+        max_time_s=120.0,
+        meta={"initial_speed_mps": 8.0},
+        tags=("pedestrian",),
+    )
+
+
+def stop_sign(length_m: float = 300.0, sign_s_m: float = 120.0, name: str = "stop_sign") -> ScenarioSpec:
+    return ScenarioSpec(
+        name=name,
+        route=tuple(_line(0.0, 0.0, 0.0, length_m)),
+        stop_signs=(StopSignSpec(sign_s_m),),
+        max_time_s=120.0,
+        meta={"initial_speed_mps": 8.0},
+        tags=("stop_sign",),
+    )
+
+
 def standard_suite() -> list[ScenarioSpec]:
-    return [straight(), curve("left"), curve("right"), lead_brake(), red_light()]
+    return [straight(), curve("left"), curve("right"), lead_brake(), red_light(), pedestrian_crossing(), stop_sign()]
 
 
 def random_scenarios(n: int, seed: int = 0, families: tuple[str, ...] = ("straight", "curve", "lead_brake")) -> list[ScenarioSpec]:

@@ -35,12 +35,29 @@ class TrafficLightSpec:
 
 
 @dataclass(frozen=True)
+class PedestrianSpec:
+    """Crosses the road at route position s_m, walking from lateral_start_m (left positive) to the opposite side."""
+
+    s_m: float
+    lateral_start_m: float
+    speed_mps: float = 1.4
+    start_t_s: float = 0.0
+
+
+@dataclass(frozen=True)
+class StopSignSpec:
+    s_m: float
+
+
+@dataclass(frozen=True)
 class ScenarioSpec:
     name: str
     route: tuple[Waypoint, ...]
     commands: tuple[RouteCommand, ...] = ()
     lead: LeadVehicleSpec | None = None
     lights: tuple[TrafficLightSpec, ...] = ()
+    pedestrians: tuple[PedestrianSpec, ...] = ()
+    stop_signs: tuple[StopSignSpec, ...] = ()
     max_time_s: float = 120.0
     speed_limit_mps: float = 13.9
     seed: int = 0
@@ -66,6 +83,9 @@ class ScenarioSpec:
         for light in self.lights:
             if light.red_s <= 0 or light.green_s <= 0:
                 raise ValueError("traffic light phases must be positive")
+        for ped in self.pedestrians:
+            if ped.speed_mps <= 0 or ped.lateral_start_m == 0 or ped.start_t_s < 0:
+                raise ValueError("pedestrian needs positive speed, nonzero lateral_start_m and start_t_s >= 0")
 
     def to_dict(self) -> dict[str, Any]:
         d = asdict(self)
@@ -89,6 +109,11 @@ class ScenarioSpec:
                 TrafficLightSpec(float(l["s_m"]), float(l.get("red_s", 10.0)), float(l.get("green_s", 10.0)), float(l.get("offset_s", 0.0)))
                 for l in d.get("lights", [])
             ),
+            pedestrians=tuple(
+                PedestrianSpec(float(q["s_m"]), float(q["lateral_start_m"]), float(q.get("speed_mps", 1.4)), float(q.get("start_t_s", 0.0)))
+                for q in d.get("pedestrians", [])
+            ),
+            stop_signs=tuple(StopSignSpec(float(q["s_m"])) for q in d.get("stop_signs", [])),
             max_time_s=float(d.get("max_time_s", 120.0)),
             speed_limit_mps=float(d.get("speed_limit_mps", 13.9)),
             seed=int(d.get("seed", 0)),

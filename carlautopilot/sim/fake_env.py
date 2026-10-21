@@ -25,6 +25,11 @@ BLOCKED_SPEED_MPS = 0.1
 BLOCKED_SECONDS = 30.0
 RED_LIGHT_SPEED_MPS = 0.5
 ROUTE_END_MARGIN_M = 1.0
+PED_CORRIDOR_M = 2.0
+PED_HIT_LONGITUDINAL_M = 2.5
+PED_HIT_LATERAL_M = 1.2
+STOP_ZONE_M = 8.0
+STOP_SPEED_MPS = 0.5
 
 
 def _wrap(a: float) -> float:
@@ -113,6 +118,7 @@ class FakeEnv:
         self._lead_s = scenario.lead.initial_gap_m if scenario.lead else None
         self._lead_v = self._lead_speed_at(0.0)
         self._light_events_done: set[int] = set()
+        self._stop_cleared: set[int] = set()
         self._off_road_time = 0.0
         self._blocked_time = 0.0
         self._done = False
@@ -135,6 +141,11 @@ class FakeEnv:
         cycle = light.red_s + light.green_s
         return ((t + light.offset_s) % cycle) < light.red_s
 
+    def _ped_lateral(self, index: int, t: float) -> float:
+        ped = self._scenario.pedestrians[index]
+        walked = ped.speed_mps * max(0.0, t - ped.start_t_s)
+        return ped.lateral_start_m - math.copysign(min(walked, 2.0 * abs(ped.lateral_start_m)), ped.lateral_start_m)
+
     def _command(self) -> Command:
         cmd = Command.FOLLOW
         for rc in self._scenario.commands:
@@ -143,12 +154,17 @@ class FakeEnv:
         return cmd
 
     def _lead_info(self) -> LeadInfo | None:
-        if self._lead_s is None:
-            return None
-        gap = self._lead_s - self._s
-        if 0.0 < gap <= LEAD_VISIBLE_M:
-            return LeadInfo(distance_m=gap, rel_speed_mps=self._lead_v - self.v)
-        return None
+        """Nearest obstacle ahead: the lead vehicle, or a pedestrian inside the lane corridor (longitudinally stationary)."""
+        found: list[LeadInfo] = []
+        if self._lead_s is not None:
+            gap = self._lead_s - self._s
+            if 0.0 < gap <= LEAD_VISIBLE_M:
+                found.append(LeadInfo(distance_m=gap, rel_speed_mps=self._lead_v - self.v))
+        for i, ped in enumerate(self._scenario.pedestrians):
+            gap = ped.s_m - self._s
+            if 0.0 < gap <= LEAD_VISIBLE_M and abs(self._ped_lateral(i, self.t)) < PED_CORRIDOR_M:
+                found.append(LeadInfo(distance_m=gap, rel_speed_mps=-self.v))
+        return min(found, key=lambda l: l.distance_m) if found else None
 
     def _extras(self) -> dict:
         if not self.privileged_obs:
@@ -171,6 +187,9 @@ class FakeEnv:
             if dist <= LEAD_VISIBLE_M:
                 extras["next_light_distance_m"] = dist
                 extras["next_light_red"] = self.light_is_red(i, self.t)
+        stops = [q.s_m - self._s for i, q in enumerate(self._scenario.stop_signs) if i not in self._stop_cleared and q.s_m - self._s > 0]
+        if stops and min(stops) <= LEAD_VISIBLE_M:
+            extras["next_stop_sign_distance_m"] = min(stops)
         return extras
 
     def _observe(self) -> Observation:
@@ -238,6 +257,20 @@ class FakeEnv:
             if prev_s < light.s_m <= self._s and self.light_is_red(i, self.t) and self.v > RED_LIGHT_SPEED_MPS:
                 events.append(Event(self.t, EventKind.RED_LIGHT, f"light {i}"))
                 self._light_events_done.add(i)
+
+        for i, ped in enumerate(self._scenario.pedestrians):
+            if termination is None and abs(self._s - ped.s_m) < PED_HIT_LONGITUDINAL_M and abs(self._lat - self._ped_lateral(i, self.t)) < PED_HIT_LATERAL_M:
+                events.append(Event(self.t, EventKind.COLLISION_PEDESTRIAN, f"pedestrian {i}"))
+                termination = "collision"
+
+        for i, sign in enumerate(self._scenario.stop_signs):
+            if i in self._stop_cleared:
+                continue
+            if sign.s_m - STOP_ZONE_M <= self._s <= sign.s_m and self.v <= STOP_SPEED_MPS:
+                self._stop_cleared.add(i)
+            elif prev_s < sign.s_m <= self._s:
+                events.append(Event(self.t, EventKind.STOP_SIGN, f"sign {i}"))
+                self._stop_cleared.add(i)
 
         if abs(self._lat) > OFF_ROAD_LATERAL_M:
             self._off_road_time += dt

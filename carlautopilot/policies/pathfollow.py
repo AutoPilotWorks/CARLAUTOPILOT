@@ -46,9 +46,15 @@ class PathFollowPolicy:
         lookahead = min(20.0, max(5.0, 0.8 * obs.speed_mps + 4.0))
         steer = PurePursuit(self.wheelbase_m, lookahead, self.max_steer_rad).steer(points)
         accel = self.acc.accel(obs, self.speed_limit_mps)
+        stops = []
         dist = obs.extras.get("next_light_distance_m")
-        if obs.extras.get("next_light_red") and dist is not None and dist < LIGHT_REACT_DISTANCE_M:
-            gap = max(dist - LIGHT_STOP_MARGIN_M, 0.1)
-            accel = min(accel, self.acc.idm.accel(obs.speed_mps, gap, obs.speed_mps))
+        if obs.extras.get("next_light_red") and dist is not None:
+            stops.append(dist)
+        if "next_stop_sign_distance_m" in obs.extras:
+            stops.append(obs.extras["next_stop_sign_distance_m"])
+        for dist in stops:
+            if dist < LIGHT_REACT_DISTANCE_M:
+                gap = max(dist - LIGHT_STOP_MARGIN_M, 0.1)
+                accel = min(accel, self.acc.idm.accel(obs.speed_mps, gap, obs.speed_mps))
         throttle, brake = self.acc.pedals(accel)
         return apply_safety(Action(steer, throttle, brake), obs, self.safety)

@@ -106,9 +106,9 @@ def test_repeatability():
 def test_run_suite_outputs(tmp_path):
     res = run_suite(env, PathFollowPolicy, standard_suite(), tmp_path / "out")
     agg = res["aggregate"]
-    assert agg["episodes"] == 5 and agg["success_rate"] == 1.0 and agg["mean_driving_score"] == pytest.approx(1.0)
+    assert agg["episodes"] == 7 and agg["success_rate"] == 1.0 and agg["mean_driving_score"] == pytest.approx(1.0)
     assert (tmp_path / "out" / "report.md").read_text(encoding="utf-8").startswith("# Evaluation report")
-    assert len(list((tmp_path / "out" / "logs").glob("*.jsonl"))) == 5
+    assert len(list((tmp_path / "out" / "logs").glob("*.jsonl"))) == 7
     with pytest.raises(FileExistsError):
         run_suite(env, PathFollowPolicy, standard_suite(), tmp_path / "out")
 
