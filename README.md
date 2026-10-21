@@ -3,8 +3,18 @@
 CARLA 시뮬레이터에서 **영상으로 판단하는 자율주행**을 만들고, 거의 모든 기능이 동작한다고 판단되면 Euro Truck Simulator 2(ETS2)로 옮기는 프로젝트입니다. 최종 목표는 화물을 배달하는 경로를 처음부터 끝까지 스스로 주행하는 것입니다.
 
 ## 현재 상태 (2026-10-21)
-- **계획 단계입니다. 코드는 아직 없습니다.** 저장소에는 문서와 작업 규칙만 있습니다.
-- 지금까지 한 일: 방향 결정(ETS2에서 CARLA로 전환), 새 저장소 생성, 계획과 규칙 문서 작성.
+- **CARLA 없이 시험할 수 있는 부분은 구현했고, CARLA 연결 코드는 아직 없습니다.** CARLA를 설치하고 공식 문서로 확인한 뒤에 `carlautopilot/carla_env/`를 만듭니다.
+- 지금까지 한 일: 방향 결정(ETS2에서 CARLA로 전환), 새 저장소 생성, 계획과 규칙 문서 작성, 공통 규격·가짜 환경·제어·평가·데이터·모델·학습·기준 정책·실행기·명령줄 구현.
+- **자동 테스트 90개가 이전 컴퓨터(Python 3.14, CPU PyTorch)에서 통과했습니다.** CARLA용 Python 3.12에서는 아직 돌려 보지 못했습니다(데스크톱에서 첫 실행 때 확인).
+- 구현은 Codex가 아니라 직접 했습니다(Codex가 요청 과다 429로 거부했고, 첫 시도에서는 쓰기 권한 문제도 있었음).
+
+## 코드를 돌려 보는 법 (CARLA 불필요)
+```bash
+python -m pytest -q
+python -m carlautopilot.cli.evaluate --out-dir <새 폴더> --title "Baseline"
+```
+- 첫 명령은 전체 테스트, 두 번째는 가짜 환경에서 기준 정책을 표준 시나리오 5개(직진, 좌·우 곡선, 앞차 급감속, 빨간불)로 평가해 로그, `metrics.json`, `report.md`를 만듭니다. 출력 폴더가 이미 있으면 거부합니다.
+- 테스트에는 `numpy`, `pytest`, `torch`(CPU로 충분), `Pillow`가 필요합니다.
 - **다음 할 일** (모두 사용자 승인 후에 시작):
   1. 집 데스크톱에서 환경 확인(Python 3.12, GPU, 디스크).
   2. CARLA 0.9.15와 Python 3.12 가상환경 설치(공식 문서 기준).
@@ -25,7 +35,8 @@ CARLA 시뮬레이터에서 **영상으로 판단하는 자율주행**을 만들
 |---|---|
 | [CLAUDE.md](CLAUDE.md) | Claude Code가 항상 지킬 규칙과 읽는 순서 |
 | [docs/working_rules.md](docs/working_rules.md) | 승인 절차, 결정 확정 규칙, 여러 컴퓨터·세션 사용 규칙, Codex 위임 규칙 |
-| [docs/plan.md](docs/plan.md) | 확정된 결정, 미확정 항목, 기능 체크리스트 초안, 일정 어림, 미확인 사실 |
+| [docs/plan.md](docs/plan.md) | 확정된 결정, 미확정 항목, 기능 체크리스트 초안, 일정 어림, 미확인 사실, 구현 현황 |
+| [docs/architecture.md](docs/architecture.md) | 모듈 구조와 계약(규약, 로그 형식, 지표 정의), CARLA 어댑터에서 확인할 것 |
 | [docs/handoff_desktop_start.md](docs/handoff_desktop_start.md) | 데스크톱에서 붙여 넣을 시작 프롬프트(환경 확인까지만 하고 멈춤) |
 
 ## 확정된 결정 요약 (2026-10-21, 상세는 plan.md)

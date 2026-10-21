@@ -37,7 +37,9 @@ CARLA 없이 먼저 만들 수 있는 부분의 설계입니다. **CARLA 연결 
 | `carlautopilot/control/` | ACC(IDM), PID, 순수 추종(pure pursuit), 안전 계층 | 작업 B |
 | `carlautopilot/eval/` | 에피소드 로그, 지표, 집계, 보고서 | 작업 C |
 | `carlautopilot/data/`, `models/`, `train/` | 데이터 형식, 데이터셋, 분할, 경로 조건부 조향 모델, 학습 루프 | 작업 D |
-| `carlautopilot/policies/`, `carlautopilot/runner.py`, `carlautopilot/scenarios_lib.py`, `carlautopilot/cli/` | 기준 정책, 에피소드·묶음 실행기, 표준 시나리오, 명령줄 | 작업 E(A~D 완료 후) |
+| `carlautopilot/policies/`, `carlautopilot/runner.py`, `carlautopilot/scenarios_lib.py`, `carlautopilot/cli/` | 기준 정책, 에피소드·묶음 실행기, 표준 시나리오, 명령줄 | 작업 E |
+
+작업 A~E는 모두 구현되어 있다(2026-10-21, 직접 작성: Codex가 429로 거부해서). 현황은 `docs/plan.md`의 "구현 현황" 참고.
 | `carlautopilot/carla_env/` | CARLA 어댑터 | **미작성**(CARLA 설치 후) |
 | `tests/<영역>/` | 각 작업의 테스트 | 각 작업 |
 
@@ -51,6 +53,7 @@ CARLA 없이 먼저 만들 수 있는 부분의 설계입니다. **CARLA 연결 
 - 사건과 종료: 앞차 간격이 0 이하이면 `collision_vehicle` 후 `collision` 종료, 횡오차 2 m 초과가 2초 이상 이어지면 `off_road` 사건 후 `off_route` 종료, 속도 0.1 m/s 미만이 30초 이상이면 `blocked`, 시간 초과는 `timeout`, 진행 거리가 경로 길이 − 1 m 이상이면 `route_complete`.
 - `reset(scenario, seed)`이 같은 입력이면 항상 같은 결과를 내야 한다(결정론적). `privileged_obs=True`이면 `extras`에 `heading_error_rad`, `lateral_error_m`, `lookahead_points`(앞쪽 경로점 목록)를 넣는다.
 - `ground_truth()`와 `close()`를 제공한다.
+- 구현에서 추가한 것: `privileged_obs`일 때 `extras`에 `next_light_distance_m`, `next_light_red`(앞쪽 100 m 이내에 신호등이 있을 때)도 넣는다. 앞차 속도 프로파일은 구간별 상수(시간 `t_k` 이후의 값)로 해석한다. `Scenario.meta["initial_speed_mps"]`로 시작 속도를 줄 수 있다.
 
 ### B. `control/`
 - `idm.py`: `IDM`(a_max, b, v0, T, s0, delta)의 `accel(v, gap, dv)`(표준 IDM 식), 그리고 `ACCController`가 `Observation`과 속도 제한으로 목표 가속도를 구해 `(throttle, brake)`로 바꾼다. 앞차가 없으면 자유 주행 항만 쓴다.

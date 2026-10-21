@@ -22,5 +22,8 @@
 - 사용자에게는 문제가 있을 때(검증 실패, 오해, 막힘, 결정 필요)와 결과를 보고합니다. 토큰을 아끼려고 전체 파일을 읽기보다 작은 명령(grep, tail 등)으로 확인합니다.
 
 ## 저장소 구조
-- 아직 코드가 없습니다. 구조는 코드가 생기면 여기에 적습니다.
+- `carlautopilot/core.py`, `scenario.py`: 공통 규격(Observation, Action, Env·Policy 인터페이스, 시나리오). 변경은 사용자 승인 후.
+- `carlautopilot/sim/`(FakeEnv), `control/`(IDM·PID·순수 추종·안전), `eval/`(로그·지표·집계·보고서), `data/`·`models/`·`train/`(에피소드 저장, 데이터셋, 폴드, 경로 조건부 조향 모델, 학습), `policies/`, `runner.py`, `scenarios_lib.py`, `cli/`.
+- `carlautopilot/carla_env/`는 **아직 없음**(CARLA 설치 후 공식 문서로 확인하며 작성). CARLA import는 그 폴더 안에서만 합니다.
+- 모듈 계약과 규약(단위, 조향 부호: 양수가 우회전)은 `docs/architecture.md`가 기준입니다. 테스트는 `python -m pytest -q`.
 - 데이터, 학습 결과, CARLA 설치 파일은 저장소 밖 데이터 루트에 둡니다(컴퓨터마다 경로가 다름).

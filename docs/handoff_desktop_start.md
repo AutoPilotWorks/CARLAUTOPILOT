@@ -12,7 +12,8 @@ CARLAUTOPILOT 프로젝트를 이 집 데스크톱(RTX 4070 SUPER 12GB)에서 �
    - `git --version`, `python --version`, `nvidia-smi`(GPU 이름, VRAM, CUDA 버전).
    - 디스크 여유 공간(CARLA는 약 20GB가 필요합니다).
    - Python 3.12가 설치되어 있는지(CARLA Python API는 3.12까지 지원합니다. 없으면 기존 Python과 나란히 설치하는 방법만 알려주세요).
-5. 환경 확인 결과를 알려주고 멈춰주세요. CARLA 설치, 가상환경 생성, 코드 작성, 학습, push는 제가 승인하기 전에는 시작하지 마세요. 설치 단계에서는 공식 문서(https://carla.readthedocs.io)로 요구 사양과 절차를 직접 확인하면서 진행하고, 확인하지 못한 내용을 확인했다고 말하지 마세요.
+5. (CARLA와 무관한 확인) 저장소에 이미 구현된 코드가 있습니다. Python 3.12 가상환경을 만들 수 있다면 `pip install -r requirements.txt`와 CPU 또는 CUDA용 `torch`, `Pillow`를 설치하고 `python -m pytest -q`를 돌려 결과를 알려주세요. 이전 컴퓨터(Python 3.14)에서는 90개가 통과했지만 3.12에서는 아직 확인하지 못했습니다. 설치가 필요하면 먼저 승인을 받으세요.
+6. 환경 확인 결과를 알려주고 멈춰주세요. CARLA 설치, 가상환경 생성, 코드 작성, 학습, push는 제가 승인하기 전에는 시작하지 마세요. 설치 단계에서는 공식 문서(https://carla.readthedocs.io)로 요구 사양과 절차를 직접 확인하면서 진행하고, 확인하지 못한 내용을 확인했다고 말하지 마세요.
 
 참고: 이전 프로젝트 ets2-autopilot-learning(비공개)은 참고용입니다. 그 코드는 쓸 만하다고 판단되면 가져와도 되지만, ETS2 데이터셋은 비상업적 연구용이라 이 프로젝트로 가져오지 않습니다. 이 저장소에서는 Claude 세션을 한 번에 하나만 사용해주세요.
 ````
