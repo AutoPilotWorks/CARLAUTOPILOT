@@ -7,12 +7,12 @@ venv/
 .ipynb_checkpoints/
 
 # Data, models, results (stay outside Git)
-data/
-datasets/
-runs/
-outputs/
-logs/
-checkpoints/
+/data/
+/datasets/
+/runs/
+/outputs/
+/logs/
+/checkpoints/
 *.pt
 *.pth
 *.ckpt
