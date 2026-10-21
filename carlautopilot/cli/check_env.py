@@ -12,9 +12,9 @@ OK, WARN, FAIL = "OK", "WARN", "FAIL"
 def check_python() -> tuple[str, str, str]:
     v = sys.version_info
     s = f"{v.major}.{v.minor}.{v.micro}"
-    if (3, 7) <= (v.major, v.minor) <= (3, 12):
+    if (3, 10) <= (v.major, v.minor) <= (3, 12):
         return OK, "python", s
-    return WARN, "python", f"{s} (CARLA 0.9.15 Python API supports 3.7-3.12)"
+    return WARN, "python", f"{s} (CARLA 0.9.16 Windows client supports 3.10-3.12)"
 
 
 def check_module(name: str, required: bool = True) -> tuple[str, str, str]:
