@@ -15,6 +15,7 @@ from carlautopilot.core import (
     StepResult,
 )
 from carlautopilot.scenario import ScenarioSpec
+from carlautopilot.sim.render import render_view
 
 LOOKAHEAD_OFFSETS_M = (3.0, 6.0, 9.0, 12.0, 15.0, 20.0, 25.0, 30.0)
 LEAD_VISIBLE_M = 100.0
@@ -82,7 +83,11 @@ class FakeEnv:
         drag: float = 0.02,
         privileged_obs: bool = False,
         speed_noise_std: float = 0.0,
+        render_images: bool = False,
+        image_size: tuple[int, int] = (64, 128),
     ):
+        self.render_images = render_images
+        self.image_size = image_size
         self.dt = dt
         self.wheelbase_m = wheelbase_m
         self.max_steer_rad = max_steer_rad
@@ -172,7 +177,20 @@ class FakeEnv:
         speed = self.v
         if self.speed_noise_std > 0:
             speed = max(0.0, speed + float(self._rng.normal(0.0, self.speed_noise_std)))
-        return Observation(t=self.t, speed_mps=speed, command=self._command(), image=None, lead=self._lead_info(), extras=self._extras())
+        image = self._render() if self.render_images else None
+        return Observation(t=self.t, speed_mps=speed, command=self._command(), image=image, lead=self._lead_info(), extras=self._extras())
+
+    def _render(self) -> np.ndarray:
+        c, s = math.cos(-self.yaw), math.sin(-self.yaw)
+        pts, normals = [], []
+        for d in np.arange(1.5, 40.0, 1.0):
+            px, py = self._route.point_at(self._s + d)
+            heading = self._route.heading_at(self._s + d)
+            dx, dy = px - self.x, py - self.y
+            pts.append((dx * c - dy * s, dx * s + dy * c))
+            nx, ny = -math.sin(heading), math.cos(heading)
+            normals.append((nx * c - ny * s, nx * s + ny * c))
+        return render_view(np.array(pts), np.array(normals), *self.image_size)
 
     def ground_truth(self) -> GroundTruth:
         return GroundTruth(

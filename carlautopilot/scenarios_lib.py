@@ -65,3 +65,45 @@ def red_light(length_m: float = 300.0, light_s_m: float = 120.0, name: str = "re
 
 def standard_suite() -> list[ScenarioSpec]:
     return [straight(), curve("left"), curve("right"), lead_brake(), red_light()]
+
+
+def random_scenarios(n: int, seed: int = 0, families: tuple[str, ...] = ("straight", "curve", "lead_brake")) -> list[ScenarioSpec]:
+    import random
+
+    rng = random.Random(seed)
+    out: list[ScenarioSpec] = []
+    for i in range(n):
+        family = families[i % len(families)]
+        name = f"{family}_{i:03d}"
+        if family == "straight":
+            sc = straight(rng.uniform(120.0, 260.0), speed_limit_mps=rng.uniform(8.0, 13.9), name=name)
+        elif family == "curve":
+            sc = curve(
+                rng.choice(["left", "right"]),
+                radius_m=rng.uniform(25.0, 60.0),
+                angle_deg=rng.uniform(45.0, 120.0),
+                lead_in_m=rng.uniform(40.0, 80.0),
+                lead_out_m=rng.uniform(40.0, 80.0),
+                speed_limit_mps=rng.uniform(5.0, 7.0),
+                name=name,
+            )
+        elif family == "lead_brake":
+            base = lead_brake(rng.uniform(250.0, 400.0), name=name)
+            gap = rng.uniform(25.0, 50.0)
+            slow = rng.uniform(1.0, 4.0)
+            out.append(
+                ScenarioSpec(
+                    name=base.name,
+                    route=base.route,
+                    lead=LeadVehicleSpec(gap, ((0.0, 10.0), (rng.uniform(10.0, 20.0), slow), (rng.uniform(25.0, 40.0), 10.0))),
+                    max_time_s=base.max_time_s,
+                    meta=base.meta,
+                    tags=base.tags,
+                    seed=i,
+                )
+            )
+            continue
+        else:
+            raise ValueError(f"unknown family {family}")
+        out.append(ScenarioSpec(**{**sc.__dict__, "seed": i}))
+    return out
