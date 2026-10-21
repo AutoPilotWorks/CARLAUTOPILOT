@@ -14,7 +14,7 @@ python -m pytest -q
 python -m carlautopilot.cli.evaluate --out-dir <새 폴더> --title "Baseline"
 ```
 - 첫 명령은 전체 테스트, 두 번째는 가짜 환경에서 기준 정책을 표준 시나리오 5개(직진, 좌·우 곡선, 앞차 급감속, 빨간불)로 평가해 로그, `metrics.json`, `report.md`를 만듭니다. 출력 폴더가 이미 있으면 거부합니다.
-- 테스트에는 `numpy`, `pytest`, `torch`(CPU로 충분), `Pillow`가 필요합니다.
+- 테스트에는 `requirements.txt`(numpy, Pillow, pytest)와 `torch`(CPU로 충분, CUDA 빌드는 따로 설치)가 필요합니다.
 - **다음 할 일** (모두 사용자 승인 후에 시작):
   1. 집 데스크톱에서 환경 확인(Python 3.12, GPU, 디스크).
   2. CARLA 0.9.15와 Python 3.12 가상환경 설치(공식 문서 기준).
