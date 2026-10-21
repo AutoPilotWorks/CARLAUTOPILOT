@@ -78,3 +78,21 @@ def test_cli_passes_loss_weights_and_backbone(tmp_path):
     cfg = torch.load(tmp_path / "out" / "checkpoint.pt", weights_only=False)["cfg"]
     assert cfg["loss_weights"] == [10.0, 0.5, 0.25]
     assert cfg["backbone"] == "small"
+
+
+def test_command_weights_equalize_commands():
+    import numpy as np
+
+    from carlautopilot.train.train_steering import command_weights
+
+    cmds = np.array([0] * 8 + [1] * 2 + [3] * 1)
+    w = command_weights(cmds)
+    totals = [w[cmds == c].sum() for c in (0, 1, 3)]
+    assert totals == pytest.approx([1.0, 1.0, 1.0])
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA"))])
+def test_balanced_and_amp_training_runs(tmp_path, device):
+    ids = make_episodes(tmp_path / "data", n_episodes=4, steps=6)
+    res = train(TrainConfig(str(tmp_path / "data"), ids[:3], ids[3:], str(tmp_path / "out"), epochs=1, device=device, balance_commands=True, amp=True))
+    assert res["history"][0]["train_loss"] > 0

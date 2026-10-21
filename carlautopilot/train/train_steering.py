@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from carlautopilot.data.episode_dataset import EpisodeDataset
 from carlautopilot.data.episode_store import list_episodes
@@ -29,6 +29,8 @@ class TrainConfig:
     seed: int = 0
     num_workers: int = 0
     backbone: str = "small"
+    balance_commands: bool = False
+    amp: bool = False
     loss_weights: list[float] = field(default_factory=lambda: [1.0, 0.5, 0.5])
 
 
@@ -44,18 +46,30 @@ def _weighted_l1(pred: torch.Tensor, target: torch.Tensor, w: torch.Tensor) -> t
     return ((pred - target).abs() * w).sum(dim=1).mean()
 
 
-def _run_epoch(model, loader, device, w, optimizer=None) -> float:
+def command_weights(commands: np.ndarray) -> np.ndarray:
+    """Per-sample weights so that every route command present is drawn equally often."""
+    counts = np.bincount(commands)
+    return 1.0 / counts[commands]
+
+
+def _run_epoch(model, loader, device, w, optimizer=None, scaler=None) -> float:
     train = optimizer is not None
     model.train(train)
     total, count = 0.0, 0
     with torch.set_grad_enabled(train):
         for batch in loader:
             image, speed, command, target = (batch[k].to(device) for k in ("image", "speed", "command", "target"))
-            loss = _weighted_l1(model(image, speed, command), target, w)
+            with torch.autocast(device.type, enabled=scaler is not None):
+                loss = _weighted_l1(model(image, speed, command).float(), target, w)
             if train:
                 optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                if scaler is None:
+                    loss.backward()
+                    optimizer.step()
+                else:
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
             total += float(loss.item()) * len(target)
             count += len(target)
     return total / max(count, 1)
@@ -77,17 +91,23 @@ def train(cfg: TrainConfig) -> dict:
     train_set = EpisodeDataset(cfg.data_root, cfg.train_ids)
     val_set = EpisodeDataset(cfg.data_root, cfg.val_ids)
     gen = torch.Generator().manual_seed(cfg.seed)
-    train_loader = DataLoader(train_set, batch_size=cfg.batch_size, shuffle=True, generator=gen, num_workers=cfg.num_workers)
+    if cfg.balance_commands:
+        cmds = np.array([int(train_set._arrays[eid]["command"][i]) for eid, i in train_set._index])
+        sampler = WeightedRandomSampler(command_weights(cmds).tolist(), num_samples=len(cmds), generator=gen)
+        train_loader = DataLoader(train_set, batch_size=cfg.batch_size, sampler=sampler, num_workers=cfg.num_workers)
+    else:
+        train_loader = DataLoader(train_set, batch_size=cfg.batch_size, shuffle=True, generator=gen, num_workers=cfg.num_workers)
     val_loader = DataLoader(val_set, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers)
 
     model = RouteSteeringNet(backbone=cfg.backbone).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+    scaler = torch.amp.GradScaler("cuda") if cfg.amp and device.type == "cuda" else None
     w = torch.tensor(cfg.loss_weights, dtype=torch.float32, device=device)
 
     history = []
     for epoch in range(1, cfg.epochs + 1):
-        tr = _run_epoch(model, train_loader, device, w, optimizer)
-        va = _run_epoch(model, val_loader, device, w)
+        tr = _run_epoch(model, train_loader, device, w, optimizer, scaler)
+        va = _run_epoch(model, val_loader, device, w, scaler=scaler)
         history.append({"epoch": epoch, "train_loss": tr, "val_loss": va})
         print(json.dumps(history[-1]), flush=True)
 
@@ -111,12 +131,14 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--backbone", default="small", choices=["small", "resnet18"])
     p.add_argument("--loss-weights", type=float, nargs=3, default=[1.0, 0.5, 0.5], help="steer throttle brake")
+    p.add_argument("--balance-commands", action="store_true")
+    p.add_argument("--amp", action="store_true", help="mixed precision (CUDA only)")
     a = p.parse_args(argv)
     folds = make_folds(list_episodes(a.data_root), a.k, a.seed)
     if not 0 <= a.fold < len(folds):
         p.error("--fold is out of range")
     train_ids, val_ids = folds[a.fold]
-    result = train(TrainConfig(a.data_root, train_ids, val_ids, a.out_dir, a.epochs, a.batch_size, a.lr, a.device, a.seed, a.num_workers, loss_weights=a.loss_weights, backbone=a.backbone))
+    result = train(TrainConfig(a.data_root, train_ids, val_ids, a.out_dir, a.epochs, a.batch_size, a.lr, a.device, a.seed, a.num_workers, loss_weights=a.loss_weights, backbone=a.backbone, balance_commands=a.balance_commands, amp=a.amp))
     print(json.dumps(result["history"][-1]))
 
 
