@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from carlautopilot.core import Action, Env, Policy
+from carlautopilot.core import Action, Env, Observation, Policy
 from carlautopilot.data.episode_store import write_episode
 from carlautopilot.scenario import ScenarioSpec
 
@@ -23,8 +23,11 @@ def collect_episode(
     noise_seed: int = 0,
     max_steps: int | None = None,
     stride: int = 1,
+    extra_samples: Callable[[Observation, Action], list[tuple[np.ndarray, Action]]] | None = None,
 ) -> dict:
     """Drive with the expert and store (image, speed, command, expert action) per step.
+
+    extra_samples(obs, action) may add (image, label) pairs for the same step, e.g. side cameras.
 
     The executed steering gets temporally correlated noise, but the stored label is the clean
     expert action, so the dataset covers off-centre states and shows how to recover from them.
@@ -43,6 +46,9 @@ def collect_episode(
         if step % stride == 0:
             rows.append((obs.t, obs.speed_mps, int(obs.command), action.steer, action.throttle, action.brake))
             images.append(obs.image)
+            for img, lab in extra_samples(obs, action) if extra_samples else ():
+                rows.append((obs.t, obs.speed_mps, int(obs.command), lab.steer, lab.throttle, lab.brake))
+                images.append(img)
         noise = NOISE_AR * noise + math.sqrt(1.0 - NOISE_AR**2) * float(rng.normal(0.0, steer_noise_std)) if steer_noise_std > 0 else 0.0
         res = env.step(Action(action.steer + noise, action.throttle, action.brake).clipped())
         obs = res.obs

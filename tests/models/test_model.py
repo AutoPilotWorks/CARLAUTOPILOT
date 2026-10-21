@@ -53,3 +53,14 @@ def test_handles_other_image_sizes():
     net = RouteSteeringNet()
     out = net(torch.rand(2, 3, 48, 96), torch.rand(2), torch.tensor([0, 1]))
     assert out.shape == (2, 3)
+
+
+def test_resnet18_backbone_output_shape_and_ranges():
+    import torch
+
+    from carlautopilot.models.route_steering import RouteSteeringNet
+
+    net = RouteSteeringNet(backbone="resnet18", pretrained=False).eval()
+    out = net(torch.rand(2, 3, 128, 256), torch.tensor([0.0, 5.0]), torch.tensor([0, 2]))
+    assert out.shape == (2, 3)
+    assert out[:, 0].abs().max() <= 1 and out[:, 1:].min() >= 0 and out[:, 1:].max() <= 1

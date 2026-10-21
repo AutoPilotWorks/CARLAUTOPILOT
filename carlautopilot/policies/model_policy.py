@@ -29,7 +29,7 @@ class ModelPolicy:
     @classmethod
     def from_checkpoint(cls, path: str | Path, **kw) -> "ModelPolicy":
         ckpt = torch.load(path, map_location=kw.get("device", "cpu"), weights_only=False)
-        model = RouteSteeringNet()
+        model = RouteSteeringNet(backbone=ckpt.get("cfg", {}).get("backbone", "small"), pretrained=False)
         model.load_state_dict(ckpt["model_state"])
         return cls(model, **kw)
 

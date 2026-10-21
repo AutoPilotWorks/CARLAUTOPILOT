@@ -68,3 +68,13 @@ def test_cli_runs_one_fold(tmp_path, capsys):
     main(["--data-root", str(tmp_path / "data"), "--out-dir", str(tmp_path / "cli"), "--k", "2", "--fold", "1", "--epochs", "1", "--batch-size", "8"])
     assert "train_loss" in capsys.readouterr().out
     assert (tmp_path / "cli" / "checkpoint.pt").is_file()
+
+
+def test_cli_passes_loss_weights_and_backbone(tmp_path):
+    from carlautopilot.train.train_steering import main
+
+    make_episodes(tmp_path / "data", n_episodes=4, steps=4)
+    main(["--data-root", str(tmp_path / "data"), "--out-dir", str(tmp_path / "out"), "--k", "2", "--epochs", "1", "--loss-weights", "10", "0.5", "0.25"])
+    cfg = torch.load(tmp_path / "out" / "checkpoint.pt", weights_only=False)["cfg"]
+    assert cfg["loss_weights"] == [10.0, 0.5, 0.25]
+    assert cfg["backbone"] == "small"

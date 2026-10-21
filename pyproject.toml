@@ -7,6 +7,7 @@ dependencies = ["numpy"]
 [project.optional-dependencies]
 dev = ["pytest"]
 train = ["torch", "torchvision"]
+carla = ["carla==0.9.16", "networkx"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

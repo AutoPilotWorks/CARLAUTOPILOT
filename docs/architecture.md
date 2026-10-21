@@ -1,12 +1,12 @@
 # 구조와 모듈 계약 (2026-10-21, 초안)
 
-CARLA 없이 먼저 만들 수 있는 부분의 설계입니다. **CARLA 연결 코드는 아직 없습니다.** 그 부분은 CARLA를 설치하고 공식 문서로 확인한 뒤에 만듭니다(`carlautopilot/carla_env/`, 미작성).
+공통 규격과 각 모듈의 계약입니다. CARLA 어댑터(`carlautopilot/carla_env/`)는 2026-10-21에 데스크톱에서 CARLA 0.9.16으로 직접 확인하며 작성했습니다(아래 "CARLA 어댑터" 절).
 
 ## 원칙
 - 환경(CARLA, 가짜 환경, 나중에 ETS2)은 `Env` 인터페이스 뒤에 숨기고, 정책·제어·평가는 환경을 몰라도 돌아가게 한다.
 - **CARLA 전용 import는 `carlautopilot/carla_env/` 안에서만** 한다.
 - 모든 모듈은 단위 테스트(pytest)를 갖고, 테스트가 통과한 것만 "동작한다"고 말한다.
-- Python 3.10 이상에서 동작해야 한다. CARLA용 Python은 3.12까지만 지원되므로 3.13 이상 전용 문법과 기능을 쓰지 않는다.
+- Python 3.10 이상에서 동작해야 한다. CARLA 0.9.16 클라이언트는 Python 3.10~3.12만 지원되므로 3.13 이상 전용 문법과 기능을 쓰지 않는다.
 - 코드 주석은 최소로, 타입 힌트는 붙인다.
 
 ## 규약
@@ -40,7 +40,7 @@ CARLA 없이 먼저 만들 수 있는 부분의 설계입니다. **CARLA 연결 
 | `carlautopilot/policies/`, `carlautopilot/runner.py`, `carlautopilot/scenarios_lib.py`, `carlautopilot/cli/` | 기준 정책, 에피소드·묶음 실행기, 표준 시나리오, 명령줄 | 작업 E |
 
 작업 A~E는 모두 구현되어 있다(2026-10-21, 직접 작성: Codex가 429로 거부해서). 현황은 `docs/plan.md`의 "구현 현황" 참고.
-| `carlautopilot/carla_env/` | CARLA 어댑터 | **미작성**(CARLA 설치 후) |
+| `carlautopilot/carla_env/` | CARLA 어댑터(`env.py`), CARLA 없이 테스트하는 경로 보조 함수(`route.py`) | 2026-10-21 작성 |
 | `tests/<영역>/` | 각 작업의 테스트 | 각 작업 |
 
 ## 모듈 계약
@@ -81,7 +81,14 @@ CARLA 없이 먼저 만들 수 있는 부분의 설계입니다. **CARLA 연결 
 - `cli/`: 묶음 평가 명령줄.
 - 통합 시험: 기준 정책이 직진과 곡선을 완주하고, 앞차 감속에서 충돌하지 않고, 빨간불에서 서야 한다.
 
-## CARLA 어댑터에서 확인할 것 (설치 후)
-- 서버 연결, 동기 모드와 고정 시간 간격, 센서(카메라) 부착과 영상 수신, 차량 생성과 제어(조향 부호 규약 포함).
-- 경로(웨이포인트) 생성과 명령 부여, 신호등·앞차 상태 조회, 충돌·차선 침범 센서.
-- 기본 자동 주행(Traffic Manager)으로 데이터 수집.
+## CARLA 어댑터 (`carla_env/`, 2026-10-21 직접 확인한 사실)
+- **조향 부호:** CARLA `VehicleControl.steer` 양수가 우회전이라 프로젝트 규약과 같다(steer=+0.5에서 yaw 0.2°→16.3°). 좌표는 CARLA가 왼손 좌표계(y가 오른쪽)라 `y`와 `yaw` 부호를 뒤집어 프로젝트 좌표로 바꾼다(`route.carla_to_xy`, `carla_yaw_to_rad`).
+- **차량:** `vehicle.lincoln.mkz_2020`, 축거 2.86 m, 앞바퀴 최대 조향각 70°(조향 1.0 = 70°). 전문가의 순수 추종에 이 값을 쓴다.
+- **동기 모드:** `fixed_delta_seconds = 0.05`, `world.tick()`마다 카메라(256×128, FOV 90, 차 앞 1.5 m·높이 1.6 m) 프레임 번호를 맞춰 받는다. Traffic Manager도 동기 모드로 둔다.
+- **경로:** CARLA 패키지의 `agents.navigation.GlobalRoutePlanner`(2 m 간격, `networkx` 필요, `--carla-root`로 경로 지정)로 출발점→도착점 경로를 만든다. 교차로 구간의 `RoadOption`(LEFT/RIGHT/STRAIGHT)을 교차로 10 m 앞부터 명령으로 주고, 교차로를 지나면 FOLLOW. 자기 경로 근처를 다시 지나는 경로 때문에 진행 거리 투영은 현재 위치 주변 구간으로 제한한다(`WindowedRoute`).
+- **앞 장애물:** 경로 복도(중심선 좌우 1.8 m) 안의 차량·보행자 중 가장 가까운 것의 차체 간 거리와 경로 방향 상대 속도. 시뮬레이터의 정답 위치로 계산하므로 레이더 같은 센서를 흉내 낸 **특권 정보**다.
+- **신호등:** 각 신호등의 정지 웨이포인트가 경로 위(2 m 이내, 방향 30° 이내)에 있으면 그 진행 거리를 정지선으로 쓴다. 빨간불에 0.5 m/s 초과로 정지선을 넘으면 `red_light`. 전문가는 빨간불과 노란불에서 선다.
+- **종료:** 충돌 센서의 모든 충돌(차량·보행자·고정물), 횡오차 2 m 초과 2초(`off_route`), 0.1 m/s 미만 **90초**(`blocked`, CARLA 신호 대기가 30초를 넘는 일이 있어서 FakeEnv의 30초보다 길게), 경로 끝 2 m 전 도달(`route_complete`), 시간 초과(경로 길이/속도×3+120초).
+- **보조 카메라(`extra_views`):** (왼쪽 거리 m, 왼쪽 회전 °) 목록. 수집 때 각 카메라 영상에 "차가 그 위치·방향에 있었다면 전문가가 냈을 조향"을 라벨로 붙인다(`route.points_seen_from`로 앞쪽 경로점을 옮겨 다시 계산). 페달 라벨은 중앙 카메라와 같다.
+- **맵 전환:** 같은 프로세스에서 `load_world`를 하면 클라이언트가 간헐적으로 강제 종료됐다(`_episode != nullptr` assert, Simulator.h). 그래서 `switch_map()`이 별도 프로세스에서 맵을 바꾸고, 수집·평가 명령은 한 번에 도시 하나만 다룬다.
+- **명령줄:** `python -m carlautopilot.cli.carla_run collect|eval --carla-root <CARLA 폴더> --town <도시> ...`. 수집은 전문가(`PathFollowPolicy`, 회전 감속 `max_lat_accel=2.0`, ACC 최소 간격 4 m)에 조향 잡음(기본 0.05)을 넣어 달리고 깨끗한 전문가 행동을 라벨로 저장한다. 평가는 `--checkpoint`가 없으면 전문가, 있으면 모델(`--model-pedals`가 없으면 페달은 ACC)을 `run_suite`로 돌린다.

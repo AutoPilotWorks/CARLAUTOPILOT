@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 
 from carlautopilot.control import ACCController, PurePursuit, SafetyConfig, apply_safety
@@ -34,10 +35,18 @@ class PathFollowPolicy:
     max_steer_rad: float = 0.5
     acc: ACCController = field(default_factory=ACCController)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
+    max_lat_accel: float | None = None
     name: str = "pathfollow"
 
     def reset(self) -> None:
         pass
+
+    def speed_cap(self, points) -> float:
+        """Speed limit from the sharpest curvature among the lookahead points (pure-pursuit arc through each)."""
+        if self.max_lat_accel is None:
+            return self.speed_limit_mps
+        kappa = max((abs(2.0 * y / (x * x + y * y)) for x, y in points if x > 0), default=0.0)
+        return min(self.speed_limit_mps, math.sqrt(self.max_lat_accel / max(kappa, 1e-6)))
 
     def act(self, obs: Observation) -> Action:
         points = obs.extras.get("lookahead_points")
@@ -45,7 +54,7 @@ class PathFollowPolicy:
             raise ValueError("PathFollowPolicy needs privileged observations (lookahead_points)")
         lookahead = min(20.0, max(5.0, 0.8 * obs.speed_mps + 4.0))
         steer = PurePursuit(self.wheelbase_m, lookahead, self.max_steer_rad).steer(points)
-        accel = self.acc.accel(obs, self.speed_limit_mps)
+        accel = self.acc.accel(obs, self.speed_cap(points))
         stops = []
         dist = obs.extras.get("next_light_distance_m")
         if obs.extras.get("next_light_red") and dist is not None:

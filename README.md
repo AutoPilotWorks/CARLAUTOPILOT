@@ -2,23 +2,32 @@
 
 CARLA 시뮬레이터에서 **영상으로 판단하는 자율주행**을 만들고, 거의 모든 기능이 동작한다고 판단되면 Euro Truck Simulator 2(ETS2)로 옮기는 프로젝트입니다. 최종 목표는 화물을 배달하는 경로를 처음부터 끝까지 스스로 주행하는 것입니다.
 
-## 현재 상태 (2026-10-21)
-- **CARLA 없이 시험할 수 있는 부분은 구현했고, CARLA 연결 코드는 아직 없습니다.** CARLA를 설치하고 공식 문서로 확인한 뒤에 `carlautopilot/carla_env/`를 만듭니다.
-- 지금까지 한 일: 방향 결정(ETS2에서 CARLA로 전환), 새 저장소 생성, 계획과 규칙 문서 작성, 공통 규격·가짜 환경·제어·평가·데이터·모델·학습·기준 정책·실행기·명령줄 구현.
-- **자동 테스트 121개가 이전 컴퓨터(Python 3.14, CPU PyTorch)에서 통과했습니다.** CARLA용 Python 3.12에서는 아직 돌려 보지 못했습니다(데스크톱에서 첫 실행 때 확인).
-- 구현은 Codex가 아니라 직접 했습니다(Codex가 요청 과다 429로 거부했고, 첫 시도에서는 쓰기 권한 문제도 있었음).
+## 현재 상태 (2026-10-21 저녁, 집 데스크톱)
+- **CARLA 0.9.16 + Python 3.12 환경을 설치했고 CARLA 어댑터(`carlautopilot/carla_env/`)를 만들었습니다.** 경로 계획(CARLA `GlobalRoutePlanner`), 다른 차량(Traffic Manager), 신호등, 충돌 판정, 보조 카메라까지 동작합니다. 세부 사실은 [docs/architecture.md](docs/architecture.md)의 "CARLA 어댑터" 절.
+- **전문가(정답 정보를 쓰는 규칙 운전자, 학습 라벨용):** 회전 감속을 넣은 뒤 Town01 7/8, Town03 8/8 완주. 처음 보는 Town02는 7/10(고정물 충돌 2, 시간 초과 1). 정답 정보를 쓰므로 "자율주행 성능"이 아닙니다.
+- **영상 모델(카메라만 보고 조향, 속도는 ACC 규칙):** 아직 **운전하지 못합니다.** 학습 도시의 새 경로(Town03)와 처음 보는 도시(Town02) 모두 완주 0, 경로 진행률 13~19%. 중앙 카메라만 쓴 v1과 보조 카메라 4대를 더한 v2가 거의 같았습니다. 주행 중 전문가 조향과 비교하면 모델이 차로에서 밀려나는 것에 거의 반응하지 않습니다(원인 추정은 "다음 할 일" 1).
+- 페달까지 모델이 내게 하면 10개 모두 출발하지 못했습니다(브레이크 라벨 0.4%, 정지 상태를 따라 하는 문제로 추정).
+- 자동 테스트 129개 통과, 1개 건너뜀(CUDA가 있으면 건너뛰는 테스트), Python 3.12 + CUDA torch.
 
-## 코드를 돌려 보는 법 (CARLA 불필요)
+## 코드를 돌려 보는 법
 ```bash
 python -m pytest -q
 python -m carlautopilot.cli.evaluate --out-dir <새 폴더> --title "Baseline"
 ```
-- 첫 명령은 전체 테스트, 두 번째는 가짜 환경에서 기준 정책을 표준 시나리오 5개(직진, 좌·우 곡선, 앞차 급감속, 빨간불)로 평가해 로그, `metrics.json`, `report.md`를 만듭니다. 출력 폴더가 이미 있으면 거부합니다.
-- 테스트에는 `requirements.txt`(numpy, Pillow, pytest)와 `torch`(CPU로 충분, CUDA 빌드는 따로 설치)가 필요합니다.
-- **다음 할 일** (모두 사용자 승인 후에 시작):
-  1. 집 데스크톱에서 환경 확인(Python 3.12, GPU, 디스크).
-  2. CARLA 0.9.15와 Python 3.12 가상환경 설치(공식 문서 기준).
-  3. CARLA 서버 실행, 카메라 영상 저장, 기본 자동 주행으로 데이터 자동 수집이 되는지 확인(첫 2주 점검).
+CARLA 서버(`CarlaUE4.exe`)를 켠 뒤:
+```bash
+python -m carlautopilot.cli.carla_run collect --carla-root <CARLA 폴더> --town Town03_Opt --episodes 10 --data-root <데이터 폴더> --stride 4 --views "1:0,-1:0,0:10,0:-10"
+python -m carlautopilot.train.train_steering --data-root <데이터 폴더> --out-dir <학습 폴더> --device cuda --num-workers 6
+python -m carlautopilot.cli.carla_run eval --carla-root <CARLA 폴더> --town Town02_Opt --episodes 10 --seed 100 --checkpoint <학습 폴더>/checkpoint.pt --out-dir <평가 폴더>
+```
+- `eval`에 `--checkpoint`가 없으면 전문가를 평가합니다. 한 번에 도시 하나만 다룹니다(맵 전환은 별도 프로세스, 이유는 architecture.md).
+- 설치: Python 3.12 가상환경에 `requirements.txt`, CUDA용 `torch`·`torchvision`(pytorch.org의 cu132 인덱스), `carla==0.9.16`, `networkx`.
+
+## 다음 할 일 (모두 사용자 승인 후)
+1. **모델이 차로 이탈에 반응하지 않는 원인 확인.** 추정: CARLA 조향 1.0이 70°라 실제 조향 라벨이 0.05 안팎으로 작고, 손실에서 페달 오차가 조향보다 커서 모델이 조향을 덜 배움. 조향 손실 가중치 10으로 다시 학습했다(결과는 docs/plan.md).
+2. 사전학습 ResNet18 백본(`--backbone resnet18`, 코드 준비됨, 아직 학습 안 함).
+3. 명령별 균형(회전 구간 비율 높이기), 페달 모델의 출발 문제.
+4. 통과 기준 수치 정하기(plan.md "아직 확정되지 않은 것").
 
 ## 처음 시작하는 법 (새 세션이나 새 컴퓨터)
 1. 저장소를 받습니다.
@@ -59,9 +68,11 @@ python -m carlautopilot.cli.evaluate --out-dir <새 폴더> --title "Baseline"
 - 코드의 경로는 컴퓨터마다 다르므로 데이터 루트 등은 인자나 설정으로 받습니다. 데이터, 학습 결과, CARLA 설치 파일은 이 저장소 밖에 둡니다.
 - 이 저장소를 만든 컴퓨터(GPU 없음)는 2026-10-21 저녁에 포맷할 예정이었습니다(완료 여부는 이 문서를 쓸 때 확인하지 못했습니다). 그 컴퓨터의 백업(취업 계획 파일, 실습 폴더, Claude 메모리, 대화 기록)은 USB의 `pre-format-backup-2026-10-21` 폴더에 있습니다.
 
-## 환경 (계획)
-- CARLA 0.9.15, Python 3.12(CARLA Python API는 3.12까지 지원). 공식 문서 기준 VRAM 8GB 이상 권장, 디스크 약 20GB, 포트 2000과 2001.
-- 이전 컴퓨터의 Python은 3.14였으므로 CARLA용 3.12 가상환경을 따로 만들어야 합니다.
+## 환경 (데스크톱, 2026-10-21 설치)
+- CARLA 0.9.16(`D:\CARLA\CARLA_0.9.16`), Python 3.12.10 가상환경(저장소 안 `.venv`, 기본 Python 3.13은 그대로), torch 2.14.1+cu132, RTX 4070 SUPER 12GB.
+- CARLA 0.9.15의 Windows 클라이언트는 Python 3.10까지만 지원해서 0.9.16으로 바꿨습니다(사용자가 직접 결정).
+- CARLA를 Epic 품질로 켜면 VRAM 약 9~11GB를 써서, 수집과 학습은 동시에 돌리지 않고 순서대로 합니다.
+- 데이터와 학습 결과는 저장소 밖(`D:\carlautopilot_data`)에 있습니다: `carla_v1`(중앙 카메라 60개, 94,360프레임, 3.96GB), `carla_v2`(카메라 5대 40개).
 
 ## 열린 질문
 - "자율주행이 가능하다"의 통과 기준(완주율, 충돌·신호위반 횟수의 수치).

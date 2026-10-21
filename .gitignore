@@ -25,7 +25,7 @@ venv/
 *.avi
 
 # CARLA binaries and caches
-CARLA_*/
+/CARLA_*/
 CarlaUE4/
 Unreal/
 

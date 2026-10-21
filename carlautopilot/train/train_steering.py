@@ -28,6 +28,7 @@ class TrainConfig:
     device: str = "cpu"
     seed: int = 0
     num_workers: int = 0
+    backbone: str = "small"
     loss_weights: list[float] = field(default_factory=lambda: [1.0, 0.5, 0.5])
 
 
@@ -79,7 +80,7 @@ def train(cfg: TrainConfig) -> dict:
     train_loader = DataLoader(train_set, batch_size=cfg.batch_size, shuffle=True, generator=gen, num_workers=cfg.num_workers)
     val_loader = DataLoader(val_set, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers)
 
-    model = RouteSteeringNet().to(device)
+    model = RouteSteeringNet(backbone=cfg.backbone).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     w = torch.tensor(cfg.loss_weights, dtype=torch.float32, device=device)
 
@@ -88,6 +89,7 @@ def train(cfg: TrainConfig) -> dict:
         tr = _run_epoch(model, train_loader, device, w, optimizer)
         va = _run_epoch(model, val_loader, device, w)
         history.append({"epoch": epoch, "train_loss": tr, "val_loss": va})
+        print(json.dumps(history[-1]), flush=True)
 
     metrics = {"history": history, "train_samples": len(train_set), "val_samples": len(val_set), "device": cfg.device}
     (out / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
@@ -106,12 +108,15 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--device", default="cpu", choices=["cpu", "cuda"])
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--num-workers", type=int, default=0)
+    p.add_argument("--backbone", default="small", choices=["small", "resnet18"])
+    p.add_argument("--loss-weights", type=float, nargs=3, default=[1.0, 0.5, 0.5], help="steer throttle brake")
     a = p.parse_args(argv)
     folds = make_folds(list_episodes(a.data_root), a.k, a.seed)
     if not 0 <= a.fold < len(folds):
         p.error("--fold is out of range")
     train_ids, val_ids = folds[a.fold]
-    result = train(TrainConfig(a.data_root, train_ids, val_ids, a.out_dir, a.epochs, a.batch_size, a.lr, a.device, a.seed))
+    result = train(TrainConfig(a.data_root, train_ids, val_ids, a.out_dir, a.epochs, a.batch_size, a.lr, a.device, a.seed, a.num_workers, loss_weights=a.loss_weights, backbone=a.backbone))
     print(json.dumps(result["history"][-1]))
 
 

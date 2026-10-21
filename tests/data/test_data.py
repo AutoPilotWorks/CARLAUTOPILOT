@@ -118,3 +118,18 @@ def test_folds_errors():
         make_folds(["a", "b"], 3)
     with pytest.raises(ValueError):
         make_folds(["a", "a", "b"], 2)
+
+
+def test_collect_extra_samples_add_rows(tmp_path):
+    from carlautopilot.core import Action
+    from carlautopilot.data.collect import collect_episode
+    from carlautopilot.data.episode_store import read_episode
+    from carlautopilot.policies import PathFollowPolicy
+    from carlautopilot.scenarios_lib import straight
+    from carlautopilot.sim import FakeEnv
+
+    extra = lambda obs, a: [(obs.image, Action(0.5, a.throttle, a.brake))]
+    info = collect_episode(FakeEnv(render_images=True, privileged_obs=True), PathFollowPolicy(), straight(), tmp_path, "e", max_steps=10, extra_samples=extra)
+    _, arrays = read_episode(tmp_path, "e")
+    assert info["steps"] == 20
+    assert list(arrays["steer"][1::2]) == [0.5] * 10
