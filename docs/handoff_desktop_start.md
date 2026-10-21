@@ -8,7 +8,7 @@ CARLAUTOPILOT 프로젝트를 이 집 데스크톱(RTX 4070 SUPER 12GB)에서 �
 1. 저장소 AutoPilotWorks/CARLAUTOPILOT(비공개, main)이 이 컴퓨터에 없다면 사용자가 정하는 폴더에 받아주세요: `git clone https://github.com/AutoPilotWorks/CARLAUTOPILOT.git`. 받은 뒤 `git log --oneline -3`을 보여주세요.
 2. `CLAUDE.md`, `docs/working_rules.md`, `docs/plan.md`를 순서대로 끝까지 읽어주세요. 특히 plan.md의 "확정된 결정"과 "아직 확정되지 않은 것"을 구분해서 이해해주세요.
 3. 읽은 내용을 5줄 이내로 요약해 제가 맞는지 확인할 수 있게 해주세요.
-4. 환경을 확인만 해주세요(설치는 하지 마세요):
+4. 환경을 확인만 해주세요(설치는 하지 마세요). 저장소를 받은 뒤에는 `python -m carlautopilot.cli.check_env`로 한 번에 점검할 수 있습니다(보고만 하고 설치하지 않음; 개별 항목은 아래):
    - `git --version`, `python --version`, `nvidia-smi`(GPU 이름, VRAM, CUDA 버전).
    - 디스크 여유 공간(CARLA는 약 20GB가 필요합니다).
    - Python 3.12가 설치되어 있는지(CARLA Python API는 3.12까지 지원합니다. 없으면 기존 Python과 나란히 설치하는 방법만 알려주세요).
