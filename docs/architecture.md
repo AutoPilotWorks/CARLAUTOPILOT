@@ -91,5 +91,8 @@
 - **종료:** 충돌 센서의 모든 충돌(차량·보행자·고정물), 횡오차 2 m 초과 2초(`off_route`), 0.1 m/s 미만 **90초**(`blocked`, CARLA 신호 대기가 30초를 넘는 일이 있어서 FakeEnv의 30초보다 길게), 경로 끝 2 m 전 도달(`route_complete`), 시간 초과(경로 길이/속도×3+120초).
 - **보조 카메라(`extra_views`):** (왼쪽 거리 m, 왼쪽 회전 °) 목록. 수집 때 각 카메라 영상에 "차가 그 위치·방향에 있었다면 전문가가 냈을 조향"을 라벨로 붙인다(`route.points_seen_from`로 앞쪽 경로점을 옮겨 다시 계산). 페달 라벨은 중앙 카메라와 같다.
 - **관전 시점(`follow_spectator`, 기본 켜짐):** CARLA 창의 관전자 카메라를 매 틱 우리 차 뒤 8 m·위 4 m에서 15° 내려다보게 옮긴다. 학습용 카메라와 별개라 데이터에 영향이 없다.
+- **차종(`vehicle`):** `VEHICLES` 표(청사진, 축거, 최대 조향각, 카메라 위치). sedan = 링컨 MKZ(2.86 m, 카메라 1.5 m·1.6 m), truck = `european_hgv`(4.42 m, 카메라 4.1 m·2.4 m). CARLA 0.9.16에는 트레일러가 없다.
+- **카메라 묶음(`rigs`):** (시야각, 회전 카메라 각도) 목록. 묶음 0이 `obs.image`, 나머지는 `extras["rig_images"]`. 회전 카메라 각도가 0이 아니면 그 묶음 전체가 경로 명령 방향(LEFT +, RIGHT -)으로 `TURN_CAMERA_RATE_DEG_S`(25°/s)씩 돈다. 차의 자세는 그대로라 라벨은 묶음과 상관없이 같다. 수집 때 `--rigs`를 주면 묶음마다 `<data-root>_fov<F>_turn<T>`에 같은 라벨로 저장한다. 평가는 `--fov`, `--turn-camera`로 같은 카메라를 쓴다.
+- **속도 옵션(데이터 무손실):** 수집 `--png-compress`(기본 6, 1이 빠름·파일 1.5배), CARLA `-RenderOffScreen`. 학습 `--cache-dir`(PNG를 한 번 풀어 둔 .npy, 픽셀 동일) + `--num-workers 0`. 수집 기록에 `sim_s`/`write_s`가 남는다.
 - **맵 전환:** 같은 프로세스에서 `load_world`를 하면 클라이언트가 간헐적으로 강제 종료됐다(`_episode != nullptr` assert, Simulator.h). 그래서 `switch_map()`이 별도 프로세스에서 맵을 바꾸고, 수집·평가 명령은 한 번에 도시 하나만 다룬다.
 - **명령줄:** `python -m carlautopilot.cli.carla_run collect|eval --carla-root <CARLA 폴더> --town <도시> ...`. 수집은 전문가(`PathFollowPolicy`, 회전 감속 `max_lat_accel=2.0`, ACC 최소 간격 4 m)에 조향 잡음(기본 0.05)을 넣어 달리고 깨끗한 전문가 행동을 라벨로 저장한다. 평가는 `--checkpoint`가 없으면 전문가, 있으면 모델(`--model-pedals`가 없으면 페달은 ACC, 기본 속도 6 m/s, 교차로 명령 중 4.5 m/s 규칙)을 `run_suite`로 돌린다.

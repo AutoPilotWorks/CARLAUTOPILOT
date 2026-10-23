@@ -15,7 +15,8 @@ def episode_dir(root: str | Path, episode_id: str) -> Path:
     return Path(root) / episode_id
 
 
-def write_episode(root: str | Path, episode_id: str, meta: dict, arrays: dict[str, np.ndarray], images: np.ndarray) -> Path:
+def write_episode(root: str | Path, episode_id: str, meta: dict, arrays: dict[str, np.ndarray], images: np.ndarray, png_compress: int = 6) -> Path:
+    """png_compress is the zlib level 0-9 (6 = Pillow default); PNG is lossless, so it only trades file size for speed."""
     d = episode_dir(root, episode_id)
     if d.exists():
         raise FileExistsError(f"episode already exists: {d}")
@@ -37,7 +38,7 @@ def write_episode(root: str | Path, episode_id: str, meta: dict, arrays: dict[st
     (d / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     np.savez(d / "steps.npz", **{k: np.asarray(arrays[k]) for k in keys})
     for i, img in enumerate(images):
-        Image.fromarray(img).save(d / "images" / f"{i:06d}.png")
+        Image.fromarray(img).save(d / "images" / f"{i:06d}.png", compress_level=png_compress)
     return d
 
 

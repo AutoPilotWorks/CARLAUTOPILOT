@@ -150,3 +150,23 @@ def test_collect_stores_expert_target_speed_only_when_available(tmp_path):
     assert float(arrays["target_speed"].max()) == 8.0
     collect_episode(FakeEnv(render_images=True), ConstantPolicy(Action(0.0, 0.3, 0.0)), straight(), tmp_path, "c", max_steps=5)
     assert "target_speed" not in read_episode(tmp_path, "c")[1]
+
+
+def test_image_cache_matches_png_and_png_level_is_lossless(tmp_path):
+    import numpy as np
+
+    from carlautopilot.data.episode_dataset import EpisodeDataset
+    from carlautopilot.data.episode_store import load_image, write_episode
+    from tests.helpers import make_episodes
+
+    ids = make_episodes(tmp_path / "data", n_episodes=2, steps=5)
+    plain = EpisodeDataset(tmp_path / "data", ids)
+    cached = EpisodeDataset(tmp_path / "data", ids, cache_dir=tmp_path / "cache")
+    for k in range(len(plain)):
+        assert (plain[k]["image"] == cached[k]["image"]).all()
+    imgs = np.random.default_rng(0).integers(0, 256, (3, 8, 16, 3), dtype=np.uint8)
+    arrays = {k: np.zeros(3) for k in ("t", "speed", "steer", "throttle", "brake")}
+    arrays["command"] = np.zeros(3, dtype=np.int64)
+    meta = {"scenario_name": "x", "seed": 0, "dt": 0.05, "image_height": 8, "image_width": 16}
+    write_episode(tmp_path / "p", "lvl1", meta, arrays, imgs, png_compress=1)
+    assert all((load_image(tmp_path / "p", "lvl1", i) == imgs[i]).all() for i in range(3))

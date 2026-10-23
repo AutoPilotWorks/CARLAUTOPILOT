@@ -31,6 +31,7 @@ class TrainConfig:
     backbone: str = "small"
     balance_commands: bool = False
     amp: bool = False
+    cache_dir: str | None = None
     loss_weights: list[float] = field(default_factory=lambda: [1.0, 0.5, 0.5])
 
 
@@ -88,8 +89,8 @@ def train(cfg: TrainConfig) -> dict:
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
 
-    train_set = EpisodeDataset(cfg.data_root, cfg.train_ids)
-    val_set = EpisodeDataset(cfg.data_root, cfg.val_ids)
+    train_set = EpisodeDataset(cfg.data_root, cfg.train_ids, cfg.cache_dir)
+    val_set = EpisodeDataset(cfg.data_root, cfg.val_ids, cfg.cache_dir)
     gen = torch.Generator().manual_seed(cfg.seed)
     if cfg.balance_commands:
         cmds = np.array([int(train_set._arrays[eid]["command"][i]) for eid, i in train_set._index])
@@ -133,12 +134,13 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--loss-weights", type=float, nargs=3, default=[1.0, 0.5, 0.5], help="steer throttle brake")
     p.add_argument("--balance-commands", action="store_true")
     p.add_argument("--amp", action="store_true", help="mixed precision (CUDA only)")
+    p.add_argument("--cache-dir", help="decoded-image cache folder (built on first use; pixels identical to the PNGs)")
     a = p.parse_args(argv)
     folds = make_folds(list_episodes(a.data_root), a.k, a.seed)
     if not 0 <= a.fold < len(folds):
         p.error("--fold is out of range")
     train_ids, val_ids = folds[a.fold]
-    result = train(TrainConfig(a.data_root, train_ids, val_ids, a.out_dir, a.epochs, a.batch_size, a.lr, a.device, a.seed, a.num_workers, loss_weights=a.loss_weights, backbone=a.backbone, balance_commands=a.balance_commands, amp=a.amp))
+    result = train(TrainConfig(a.data_root, train_ids, val_ids, a.out_dir, a.epochs, a.batch_size, a.lr, a.device, a.seed, a.num_workers, loss_weights=a.loss_weights, backbone=a.backbone, balance_commands=a.balance_commands, amp=a.amp, cache_dir=a.cache_dir))
     print(json.dumps(result["history"][-1]))
 
 

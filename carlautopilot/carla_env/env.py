@@ -27,6 +27,12 @@ from carlautopilot.sim.fake_env import (
 VEHICLE = "vehicle.lincoln.mkz_2020"
 WHEELBASE_M = 2.86
 MAX_STEER_RAD = math.radians(70.0)
+# name -> (blueprint, wheelbase m, max front-wheel steer rad, camera x m, camera z m); measured 2026-10-21/24
+VEHICLES = {
+    "sedan": (VEHICLE, WHEELBASE_M, MAX_STEER_RAD, 1.5, 1.6),
+    "truck": ("vehicle.carlamotors.european_hgv", 4.42, math.radians(70.0), 4.1, 2.4),
+}
+TURN_CAMERA_RATE_DEG_S = 25.0
 ROUTE_END_MARGIN_M = 2.0
 BLOCKED_SECONDS = 90.0  # CARLA reds at 4-way junctions can exceed 30 s
 CORRIDOR_HALF_M = 1.8
@@ -79,8 +85,19 @@ class CarlaEnv:
         timeout_s: float = 60.0,
         extra_views: tuple[tuple[float, float], ...] = (),
         follow_spectator: bool = True,
+        vehicle: str = "sedan",
+        rigs: tuple[tuple[float, float], ...] = ((90.0, 0.0),),
     ):
-        """extra_views: additional cameras as (offset left m, yaw left deg); their images go to extras["view_images"]."""
+        """extra_views: additional cameras as (offset left m, yaw left deg); their images go to extras["view_images"].
+
+        rigs: camera sets as (fov deg, turn camera deg). Rig 0 gives obs.image (+ view_images); every rig has the centre
+        camera plus extra_views, and rigs 1.. go to extras["rig_images"] as [centre, *views]. A nonzero turn camera angle
+        swings the whole rig toward the route command (LEFT +, RIGHT -) at TURN_CAMERA_RATE_DEG_S; labels do not change
+        because the vehicle pose does not.
+        """
+        self.vehicle = vehicle
+        self.blueprint, self.wheelbase_m, self.max_steer_rad, self.cam_x, self.cam_z = VEHICLES[vehicle]
+        self.rigs = tuple(rigs)
         self.dt = dt
         self.extra_views = tuple(extra_views)
         self.follow_spectator = follow_spectator
@@ -98,8 +115,11 @@ class CarlaEnv:
         self._ego = None
         self._scenario: ScenarioSpec | None = None
         self._queues: list[queue.Queue] = []
+        self._cams: list[tuple[int, float, float, object]] = []
+        self._rig_yaw: list[float] = [0.0] * len(self.rigs)
         self._last_image: np.ndarray | None = None
         self._view_images: list[np.ndarray] = []
+        self._rig_images: list[list[np.ndarray]] = []
 
     def check_town(self, town: str) -> None:
         name = self.world.get_map().name
@@ -177,22 +197,25 @@ class CarlaEnv:
 
         x, y, z, yaw = meta["start"]
         start = carla.Transform(carla.Location(x=x, y=y, z=z + 0.5), carla.Rotation(yaw=yaw))
-        self._ego = self.world.spawn_actor(bpl.find(VEHICLE), start)
+        self._ego = self.world.spawn_actor(bpl.find(self.blueprint), start)
         self._actors.append(self._ego)
 
-        self._queues: list[queue.Queue] = []
+        self._queues = []
+        self._cams = []
+        self._rig_yaw = [0.0] * len(self.rigs)
         if self.render_images:
-            cam_bp = bpl.find("sensor.camera.rgb")
-            cam_bp.set_attribute("image_size_x", str(self.image_size[1]))
-            cam_bp.set_attribute("image_size_y", str(self.image_size[0]))
-            cam_bp.set_attribute("fov", "90")
-            for dy, dyaw in ((0.0, 0.0),) + self.extra_views:
-                mount = carla.Transform(carla.Location(x=1.5, y=-dy, z=1.6), carla.Rotation(yaw=-dyaw))
-                cam = self.world.spawn_actor(cam_bp, mount, attach_to=self._ego)
-                q: queue.Queue = queue.Queue()
-                cam.listen(q.put)
-                self._queues.append(q)
-                self._actors.append(cam)
+            for r, (fov, _) in enumerate(self.rigs):
+                cam_bp = bpl.find("sensor.camera.rgb")
+                cam_bp.set_attribute("image_size_x", str(self.image_size[1]))
+                cam_bp.set_attribute("image_size_y", str(self.image_size[0]))
+                cam_bp.set_attribute("fov", str(fov))
+                for dy, dyaw in ((0.0, 0.0),) + self.extra_views:
+                    cam = self.world.spawn_actor(cam_bp, self._mount(dy, dyaw), attach_to=self._ego)
+                    q: queue.Queue = queue.Queue()
+                    cam.listen(q.put)
+                    self._queues.append(q)
+                    self._cams.append((r, dy, dyaw, cam))
+                    self._actors.append(cam)
         self._collisions: list = []
         col = self.world.spawn_actor(bpl.find("sensor.other.collision"), carla.Transform(), attach_to=self._ego)
         col.listen(self._collisions.append)
@@ -239,6 +262,21 @@ class CarlaEnv:
                     found.append((s, light))
         return sorted(found, key=lambda f: f[0])
 
+    def _mount(self, dy: float, dyaw: float):
+        return carla.Transform(carla.Location(x=self.cam_x, y=-dy, z=self.cam_z), carla.Rotation(yaw=-dyaw))
+
+    def _swing_turn_cameras(self) -> None:
+        cmd = self._command()
+        for r, (_, turn_deg) in enumerate(self.rigs):
+            if not turn_deg:
+                continue
+            target = turn_deg if cmd == Command.LEFT else -turn_deg if cmd == Command.RIGHT else 0.0
+            step = TURN_CAMERA_RATE_DEG_S * self.dt
+            self._rig_yaw[r] += max(-step, min(step, target - self._rig_yaw[r]))
+            for rig, dy, dyaw, cam in self._cams:
+                if rig == r:
+                    cam.set_transform(self._mount(dy, dyaw + self._rig_yaw[r]))
+
     def _tick(self) -> None:
         frame = self.world.tick()
         images = []
@@ -250,7 +288,10 @@ class CarlaEnv:
             a = np.frombuffer(img.raw_data, dtype=np.uint8).reshape(img.height, img.width, 4)
             images.append(np.ascontiguousarray(a[:, :, 2::-1]))
         if images:
-            self._last_image, self._view_images = images[0], images[1:]
+            k = 1 + len(self.extra_views)
+            groups = [images[i:i + k] for i in range(0, len(images), k)]
+            self._last_image, self._view_images = groups[0][0], groups[0][1:]
+            self._rig_images = groups[1:]
 
     def _follow(self, tr) -> None:
         back = tr.get_forward_vector()
@@ -310,6 +351,7 @@ class CarlaEnv:
             pts.append((dx * c - dy * s, dx * s + dy * c))
         extras = {
             "view_images": self._view_images,
+            "rig_images": self._rig_images,
             "heading_error_rad": _wrap(self.yaw - self._route.heading_at(self._s)),
             "lateral_error_m": self._lat,
             "lookahead_points": pts,
@@ -336,6 +378,8 @@ class CarlaEnv:
             raise RuntimeError("episode finished; call reset()")
         a = action.clipped()
         self._ego.apply_control(carla.VehicleControl(throttle=a.throttle, steer=a.steer, brake=a.brake))
+        if self.render_images:
+            self._swing_turn_cameras()
         prev_s = self._s
         self._tick()
         self.t += self.dt

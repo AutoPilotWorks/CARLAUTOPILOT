@@ -15,7 +15,7 @@ from collections import Counter
 from pathlib import Path
 
 from carlautopilot.carla_env.route import points_seen_from
-from carlautopilot.carla_env.env import MAX_STEER_RAD, WHEELBASE_M, CarlaEnv, switch_map
+from carlautopilot.carla_env.env import VEHICLES, CarlaEnv, switch_map
 from carlautopilot.control import IDM, ACCController
 from carlautopilot.core import Action, Observation
 from carlautopilot.data.collect import collect_episode
@@ -33,14 +33,20 @@ def make_scenarios(env: CarlaEnv, a: argparse.Namespace) -> list[ScenarioSpec]:
     ]
 
 
-def expert(speed: float) -> PathFollowPolicy:
-    return PathFollowPolicy(speed_limit_mps=speed, wheelbase_m=WHEELBASE_M, max_steer_rad=MAX_STEER_RAD, acc=ACC, max_lat_accel=2.0,
-        lookahead_gain=0.5, lookahead_offset_m=2.0, lookahead_min_m=3.0)  # shorter look-ahead: long one cut junction corners
+# pure-pursuit look-ahead (gain, offset m, min m); the sedan's short one stops junction corner cutting (2026-10-23)
+EXPERT_LOOKAHEAD = {"sedan": (0.5, 2.0, 3.0), "truck": (0.5, 2.0, 3.0)}
 
 
-def view_labeler(views: tuple[tuple[float, float], ...], speed: float):
+def expert(speed: float, vehicle: str = "sedan") -> PathFollowPolicy:
+    _, wheelbase, max_steer, _, _ = VEHICLES[vehicle]
+    gain, offset, minimum = EXPERT_LOOKAHEAD[vehicle]
+    return PathFollowPolicy(speed_limit_mps=speed, wheelbase_m=wheelbase, max_steer_rad=max_steer, acc=ACC, max_lat_accel=2.0,
+                            lookahead_gain=gain, lookahead_offset_m=offset, lookahead_min_m=minimum)
+
+
+def view_labeler(views: tuple[tuple[float, float], ...], speed: float, vehicle: str = "sedan"):
     """Label each extra camera with the expert steer for the pose that camera represents; pedals stay the centre ones."""
-    pol = expert(speed)
+    pol = expert(speed, vehicle)
 
     def samples(obs: Observation, action: Action) -> list:
         out = []
@@ -56,8 +62,20 @@ def parse_views(spec: str) -> tuple[tuple[float, float], ...]:
     return tuple((float(dy), float(dyaw)) for dy, dyaw in (v.split(":") for v in spec.split(",") if v))
 
 
+def parse_rigs(spec: str) -> tuple[tuple[float, float], ...]:
+    return tuple((float(f), float(t)) for f, t in (v.split(":") for v in spec.split(",") if v))
+
+
+def rig_roots(data_root: str, rigs_spec: str) -> list[Path]:
+    """Without --rigs the data goes to --data-root; with it, each rig gets <data-root>_fov<F>_turn<T>."""
+    if not rigs_spec:
+        return [Path(data_root)]
+    return [Path(f"{data_root}_fov{f:g}_turn{t:g}") for f, t in parse_rigs(rigs_spec)]
+
+
 def collect(a: argparse.Namespace, env: CarlaEnv) -> None:
-    root = Path(a.data_root)
+    roots = rig_roots(a.data_root, a.rigs)
+    root = roots[0]
     (root / "scenarios").mkdir(parents=True, exist_ok=True)
     for sc in make_scenarios(env, a):
         eid = sc.name
@@ -65,7 +83,11 @@ def collect(a: argparse.Namespace, env: CarlaEnv) -> None:
             continue
         sc.save(root / "scenarios" / f"{eid}.json")
         t0 = time.time()
-        info = collect_episode(env, expert(a.speed), sc, root, eid, steer_noise_std=a.noise, noise_seed=zlib.crc32(eid.encode()), stride=a.stride, extra_samples=view_labeler(env.extra_views, a.speed) if env.extra_views else None)
+        info = collect_episode(
+            env, expert(a.speed, a.vehicle), sc, root, eid, steer_noise_std=a.noise, noise_seed=zlib.crc32(eid.encode()), stride=a.stride,
+            extra_samples=view_labeler(env.extra_views, a.speed, a.vehicle) if env.extra_views else None, png_compress=a.png_compress,
+            stream_images=(lambda obs: obs.extras["rig_images"]) if len(roots) > 1 else None, stream_roots=roots[1:],
+        )
         info["wall_s"] = round(time.time() - t0, 1)
         info["weather"] = sc.meta["weather"]
         with open(root / "collect_log.jsonl", "a", encoding="utf-8") as f:
@@ -78,7 +100,7 @@ def evaluate(a: argparse.Namespace, env: CarlaEnv) -> None:
 
     scs = make_scenarios(env, a)
     if a.checkpoint is None:
-        factory, title = (lambda: expert(a.speed)), "CARLA: privileged expert"
+        factory, title = (lambda: expert(a.speed, a.vehicle)), f"CARLA {a.town}: privileged expert ({a.vehicle})"
     else:
         from carlautopilot.policies.model_policy import ModelPolicy
 
@@ -102,10 +124,13 @@ def main(argv: list[str] | None = None) -> None:
         q.add_argument("--seed", type=int, default=0)
         q.add_argument("--host", default="localhost")
         q.add_argument("--port", type=int, default=2000)
+        q.add_argument("--vehicle", default="sedan", choices=sorted(VEHICLES))
     c = sub.choices["collect"]
     c.add_argument("--data-root", required=True)
     c.add_argument("--noise", type=float, default=0.05)
     c.add_argument("--stride", type=int, default=2)
+    c.add_argument("--png-compress", type=int, default=6, help="PNG zlib level 0-9 (lossless); lower is faster, files larger")
+    c.add_argument("--rigs", default="", help="camera rigs as fov:turn_deg, comma separated, e.g. 120:0,90:25 (one data root per rig)")
     c.add_argument("--views", default="", help="extra cameras as left_offset_m:left_yaw_deg, comma separated, e.g. 1:0,-1:0,0:10,0:-10")
     e = sub.choices["eval"]
     e.add_argument("--out-dir", required=True)
@@ -114,10 +139,13 @@ def main(argv: list[str] | None = None) -> None:
     e.add_argument("--model-speed", type=float, default=6.0, help="ACC speed limit for the model (expert data rarely exceeds ~5-6 m/s)")
     e.add_argument("--turn-speed", type=float, default=4.5, help="ACC speed cap while the command is LEFT/RIGHT/STRAIGHT (rule)")
     e.add_argument("--device", default="cuda", choices=["cpu", "cuda"])
+    e.add_argument("--fov", type=float, default=90.0)
+    e.add_argument("--turn-camera", type=float, default=0.0, help="swing the camera toward LEFT/RIGHT commands by this many degrees")
     a = p.parse_args(argv)
     switch_map(a.town, a.host, a.port)
     views = parse_views(a.views) if a.mode == "collect" else ()
-    env = CarlaEnv(a.host, a.port, privileged_obs=a.mode == "collect" or a.checkpoint is None, extra_views=views)
+    rigs = (parse_rigs(a.rigs) or ((90.0, 0.0),)) if a.mode == "collect" else ((a.fov, a.turn_camera),)
+    env = CarlaEnv(a.host, a.port, privileged_obs=a.mode == "collect" or a.checkpoint is None, extra_views=views, vehicle=a.vehicle, rigs=rigs)
     try:
         collect(a, env) if a.mode == "collect" else evaluate(a, env)
     finally:
