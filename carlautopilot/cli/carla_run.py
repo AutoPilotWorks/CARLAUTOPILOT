@@ -34,7 +34,8 @@ def make_scenarios(env: CarlaEnv, a: argparse.Namespace) -> list[ScenarioSpec]:
 
 
 def expert(speed: float) -> PathFollowPolicy:
-    return PathFollowPolicy(speed_limit_mps=speed, wheelbase_m=WHEELBASE_M, max_steer_rad=MAX_STEER_RAD, acc=ACC, max_lat_accel=2.0)
+    return PathFollowPolicy(speed_limit_mps=speed, wheelbase_m=WHEELBASE_M, max_steer_rad=MAX_STEER_RAD, acc=ACC, max_lat_accel=2.0,
+        lookahead_gain=0.5, lookahead_offset_m=2.0, lookahead_min_m=3.0)  # shorter look-ahead: long one cut junction corners
 
 
 def view_labeler(views: tuple[tuple[float, float], ...], speed: float):

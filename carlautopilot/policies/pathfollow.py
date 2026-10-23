@@ -36,6 +36,9 @@ class PathFollowPolicy:
     acc: ACCController = field(default_factory=ACCController)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     max_lat_accel: float | None = None
+    lookahead_gain: float = 0.8
+    lookahead_offset_m: float = 4.0
+    lookahead_min_m: float = 5.0
     name: str = "pathfollow"
 
     def reset(self) -> None:
@@ -52,7 +55,7 @@ class PathFollowPolicy:
         points = obs.extras.get("lookahead_points")
         if not points:
             raise ValueError("PathFollowPolicy needs privileged observations (lookahead_points)")
-        lookahead = min(20.0, max(5.0, 0.8 * obs.speed_mps + 4.0))
+        lookahead = min(20.0, max(self.lookahead_min_m, self.lookahead_gain * obs.speed_mps + self.lookahead_offset_m))
         steer = PurePursuit(self.wheelbase_m, lookahead, self.max_steer_rad).steer(points)
         accel = self.acc.accel(obs, self.speed_cap(points))
         stops = []
