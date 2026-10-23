@@ -7,6 +7,7 @@ import numpy as np
 from PIL import Image
 
 ARRAY_KEYS = ("t", "speed", "command", "steer", "throttle", "brake")
+OPTIONAL_KEYS = ("target_speed",)
 META_KEYS = ("scenario_name", "seed", "dt", "image_height", "image_width")
 
 
@@ -25,7 +26,8 @@ def write_episode(root: str | Path, episode_id: str, meta: dict, arrays: dict[st
     if missing:
         raise ValueError(f"arrays are missing keys: {missing}")
     n = len(arrays["t"])
-    if any(len(arrays[k]) != n for k in ARRAY_KEYS) or len(images) != n:
+    keys = ARRAY_KEYS + tuple(k for k in OPTIONAL_KEYS if k in arrays)
+    if any(len(arrays[k]) != n for k in keys) or len(images) != n:
         raise ValueError("array and image lengths differ")
     if images.dtype != np.uint8 or images.ndim != 4 or images.shape[3] != 3:
         raise ValueError("images must be uint8 with shape (N, H, W, 3)")
@@ -33,7 +35,7 @@ def write_episode(root: str | Path, episode_id: str, meta: dict, arrays: dict[st
         raise ValueError("image size does not match meta")
     (d / "images").mkdir(parents=True)
     (d / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-    np.savez(d / "steps.npz", **{k: np.asarray(arrays[k]) for k in ARRAY_KEYS})
+    np.savez(d / "steps.npz", **{k: np.asarray(arrays[k]) for k in keys})
     for i, img in enumerate(images):
         Image.fromarray(img).save(d / "images" / f"{i:06d}.png")
     return d
@@ -72,7 +74,7 @@ def read_episode(root: str | Path, episode_id: str) -> tuple[dict, dict[str, np.
     d = episode_dir(root, episode_id)
     meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
     with np.load(d / "steps.npz") as z:
-        arrays = {k: z[k] for k in ARRAY_KEYS}
+        arrays = {k: z[k] for k in ARRAY_KEYS + OPTIONAL_KEYS if k in z.files}
     return meta, arrays
 
 

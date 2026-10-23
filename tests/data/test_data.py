@@ -133,3 +133,20 @@ def test_collect_extra_samples_add_rows(tmp_path):
     _, arrays = read_episode(tmp_path, "e")
     assert info["steps"] == 20
     assert list(arrays["steer"][1::2]) == [0.5] * 10
+
+
+def test_collect_stores_expert_target_speed_only_when_available(tmp_path):
+    from carlautopilot.core import Action
+    from carlautopilot.data.collect import collect_episode
+    from carlautopilot.data.episode_store import read_episode
+    from carlautopilot.policies import ConstantPolicy, PathFollowPolicy
+    from carlautopilot.scenarios_lib import straight
+    from carlautopilot.sim import FakeEnv
+
+    extra = lambda obs, a: [(obs.image, a)]
+    collect_episode(FakeEnv(render_images=True, privileged_obs=True), PathFollowPolicy(speed_limit_mps=8.0, max_lat_accel=2.0), straight(), tmp_path, "e", max_steps=10, extra_samples=extra)
+    _, arrays = read_episode(tmp_path, "e")
+    assert len(arrays["target_speed"]) == len(arrays["steer"]) == 20
+    assert float(arrays["target_speed"].max()) == 8.0
+    collect_episode(FakeEnv(render_images=True), ConstantPolicy(Action(0.0, 0.3, 0.0)), straight(), tmp_path, "c", max_steps=5)
+    assert "target_speed" not in read_episode(tmp_path, "c")[1]

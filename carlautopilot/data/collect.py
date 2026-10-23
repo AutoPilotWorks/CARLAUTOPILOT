@@ -39,16 +39,18 @@ def collect_episode(
     rng = np.random.default_rng(noise_seed)
     limit = max_steps if max_steps is not None else int(scenario.max_time_s / env.dt) + 10
     noise = 0.0
-    rows, images = [], []
+    rows, images, target_speeds = [], [], []
     termination = None
     for step in range(limit):
         action = expert.act(obs).clipped()
         if step % stride == 0:
             rows.append((obs.t, obs.speed_mps, int(obs.command), action.steer, action.throttle, action.brake))
             images.append(obs.image)
+            target_speeds.append(getattr(expert, "last_target_speed", None))
             for img, lab in extra_samples(obs, action) if extra_samples else ():
                 rows.append((obs.t, obs.speed_mps, int(obs.command), lab.steer, lab.throttle, lab.brake))
                 images.append(img)
+                target_speeds.append(target_speeds[-1])
         noise = NOISE_AR * noise + math.sqrt(1.0 - NOISE_AR**2) * float(rng.normal(0.0, steer_noise_std)) if steer_noise_std > 0 else 0.0
         res = env.step(Action(action.steer + noise, action.throttle, action.brake).clipped())
         obs = res.obs
@@ -66,6 +68,8 @@ def collect_episode(
         "throttle": throttle.astype(np.float32),
         "brake": brake.astype(np.float32),
     }
+    if all(v is not None for v in target_speeds):
+        arrays["target_speed"] = np.array(target_speeds, dtype=np.float32)
     stack = np.stack(images)
     meta = {
         "scenario_name": scenario.name,

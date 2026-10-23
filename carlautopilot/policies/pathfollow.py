@@ -57,7 +57,9 @@ class PathFollowPolicy:
             raise ValueError("PathFollowPolicy needs privileged observations (lookahead_points)")
         lookahead = min(20.0, max(self.lookahead_min_m, self.lookahead_gain * obs.speed_mps + self.lookahead_offset_m))
         steer = PurePursuit(self.wheelbase_m, lookahead, self.max_steer_rad).steer(points)
-        accel = self.acc.accel(obs, self.speed_cap(points))
+        # road-geometry speed (curvature cap), stored as a label so a model can learn speed later
+        self.last_target_speed = self.speed_cap(points)
+        accel = self.acc.accel(obs, self.last_target_speed)
         stops = []
         dist = obs.extras.get("next_light_distance_m")
         if obs.extras.get("next_light_red") and dist is not None:
