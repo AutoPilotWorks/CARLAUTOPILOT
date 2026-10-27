@@ -193,3 +193,46 @@ def test_stop_needed_label_takes_the_nearest_stop_sign_yield_or_red_light():
     assert perception_labels(Observation(**base, extras=ex))[:2] == (0.0, 40.0)
     assert perception_labels(Observation(**base, extras={**ex, "yield_distance_m": 15.0, "next_stop_sign_distance_m": 25.0}))[:2] == (1.0, 15.0)
     assert perception_labels(Observation(**base, extras={**ex, "next_light_red": True, "yield_distance_m": 15.0}))[:2] == (1.0, 10.0)
+
+
+def test_stop_labels_split_by_cause_and_keep_served_signs():
+    from carlautopilot.core import Command, Observation
+    from carlautopilot.data.collect import stop_labels
+
+    base = {"lookahead_points": [(5.0, 0.0)]}
+    obs = lambda **x: Observation(t=0.0, speed_mps=0.0, command=Command.FOLLOW, extras={**base, **x})
+    assert stop_labels(Observation(t=0.0, speed_mps=0.0, command=Command.FOLLOW)) is None
+    assert stop_labels(obs()) == (0.0, 40.0, 40.0, 0.0, 40.0)
+    assert stop_labels(obs(next_light_distance_m=12.0, next_light_red=False)) == (0.0, 40.0, 40.0, 0.0, 40.0)
+    assert stop_labels(obs(next_light_distance_m=12.0, next_light_red=True)) == (1.0, 12.0, 40.0, 0.0, 40.0)
+    # a served sign (no next_stop_sign_distance_m) is still seen
+    assert stop_labels(obs(stop_sign_distance_m=7.0, yield_distance_m=9.0)) == (0.0, 40.0, 7.0, 1.0, 9.0)
+    assert stop_labels(obs(stop_sign_distance_m=60.0)) == (0.0, 40.0, 40.0, 0.0, 40.0)
+
+
+def test_light_camera_images_round_trip_through_store_cache_and_dataset(tmp_path):
+    import numpy as np
+    import pytest
+
+    from carlautopilot.data.episode_dataset import EpisodeDataset
+    from carlautopilot.data.episode_store import load_image, validate_episode, write_episode
+    from tests.helpers import make_episodes
+
+    ids = make_episodes(tmp_path / "d", n_episodes=1, steps=6, light=True)
+    assert validate_episode(tmp_path / "d", ids[0]) == 6
+    plain = EpisodeDataset(tmp_path / "d", ids, light=True)
+    cached = EpisodeDataset(tmp_path / "d", ids, cache_dir=tmp_path / "c", light=True)
+    for i in range(6):
+        want = load_image(tmp_path / "d", ids[0], i // 2, "light")
+        assert np.array_equal((plain[i]["light"].permute(1, 2, 0).numpy() * 255).round().astype(np.uint8), want)
+        assert np.array_equal(plain[i]["light"].numpy(), cached[i]["light"].numpy())
+    assert "light" not in EpisodeDataset(tmp_path / "d", ids)[0]
+    a = {"t": np.zeros(2), "speed": np.zeros(2, np.float32), "command": np.zeros(2, np.int64), "steer": np.zeros(2, np.float32),
+         "throttle": np.zeros(2, np.float32), "brake": np.zeros(2, np.float32), "light_idx": np.array([0, 1])}
+    meta = {"scenario_name": "x", "seed": 0, "dt": 0.1, "image_height": 4, "image_width": 4}
+    img = np.zeros((2, 4, 4, 3), np.uint8)
+    with pytest.raises(ValueError):
+        write_episode(tmp_path / "e", "bad", meta, a, img, light_images=img[:1])
+    make_episodes(tmp_path / "d2", n_episodes=1, steps=2)
+    with pytest.raises(ValueError):
+        EpisodeDataset(tmp_path / "d2", ["ep000"], light=True)

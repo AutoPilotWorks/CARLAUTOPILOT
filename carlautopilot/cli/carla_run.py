@@ -37,11 +37,12 @@ def make_scenarios(env: CarlaEnv, a: argparse.Namespace) -> list[ScenarioSpec]:
 EXPERT_LOOKAHEAD = {"sedan": (0.5, 2.0, 3.0), "truck": (0.5, 2.0, 3.0), "truck_cab": (0.5, 2.0, 3.0)}
 
 
-def expert(speed: float, vehicle: str = "sedan") -> PathFollowPolicy:
+def expert(speed: float, vehicle: str = "sedan", start_delay_max_s: float = 0.0, start_delay_seed: int = 0) -> PathFollowPolicy:
     _, wheelbase, max_steer, _, _, _ = VEHICLES[vehicle]
     gain, offset, minimum = EXPERT_LOOKAHEAD[vehicle]
     return PathFollowPolicy(speed_limit_mps=speed, wheelbase_m=wheelbase, max_steer_rad=max_steer, acc=ACC, max_lat_accel=2.0,
-                            lookahead_gain=gain, lookahead_offset_m=offset, lookahead_min_m=minimum)
+                            lookahead_gain=gain, lookahead_offset_m=offset, lookahead_min_m=minimum,
+                            start_delay_max_s=start_delay_max_s, start_delay_seed=start_delay_seed)
 
 
 def view_labeler(views: tuple[tuple[float, float], ...], speed: float, vehicle: str = "sedan"):
@@ -84,7 +85,7 @@ def collect(a: argparse.Namespace, env: CarlaEnv) -> None:
         sc.save(root / "scenarios" / f"{eid}.json")
         t0 = time.time()
         info = collect_episode(
-            env, expert(a.speed, a.vehicle), sc, root, eid, steer_noise_std=a.noise, noise_seed=zlib.crc32(eid.encode()), stride=a.stride,
+            env, expert(a.speed, a.vehicle, a.start_delay, zlib.crc32(eid.encode())), sc, root, eid, steer_noise_std=a.noise, noise_seed=zlib.crc32(eid.encode()), stride=a.stride,
             extra_samples=view_labeler(env.extra_views, a.speed, a.vehicle) if env.extra_views else None, png_compress=a.png_compress,
             stream_images=(lambda obs: obs.extras["rig_images"]) if len(roots) > 1 else None, stream_roots=roots[1:],
         )
@@ -129,10 +130,12 @@ def main(argv: list[str] | None = None) -> None:
         q.add_argument("--port", type=int, default=2000)
         q.add_argument("--tm-port", type=int, default=8000, help="Traffic Manager port; give each parallel CARLA server its own")
         q.add_argument("--vehicle", default="sedan", choices=sorted(VEHICLES))
+        q.add_argument("--light-camera", default="", help="traffic-light camera fov:pitch_up_deg:HxW, e.g. 30:9:128x256 (never swung)")
     c = sub.choices["collect"]
     c.add_argument("--data-root", required=True)
     c.add_argument("--noise", type=float, default=0.05)
     c.add_argument("--stride", type=int, default=2)
+    c.add_argument("--start-delay", type=float, default=0.0, help="expert waits a random 0..this s after a stop reason clears (reaction time)")
     c.add_argument("--png-compress", type=int, default=6, help="PNG zlib level 0-9 (lossless); lower is faster, files larger")
     c.add_argument("--rigs", default="", help="camera rigs as fov:turn_deg, comma separated, e.g. 120:0,90:25 (one data root per rig)")
     c.add_argument("--views", default="", help="extra cameras as left_offset_m:left_yaw_deg, comma separated, e.g. 1:0,-1:0,0:10,0:-10")
@@ -151,7 +154,12 @@ def main(argv: list[str] | None = None) -> None:
     views = parse_views(a.views) if a.mode == "collect" else ()
     rigs = (parse_rigs(a.rigs) or ((90.0, 0.0),)) if a.mode == "collect" else ((a.fov, a.turn_camera),)
     h, w = (int(v) for v in a.image_size.lower().split("x"))
-    env = CarlaEnv(a.host, a.port, tm_port=a.tm_port, image_size=(h, w), junction_rules=a.junction_rules, privileged_obs=a.mode == "collect" or a.checkpoint is None, extra_views=views, vehicle=a.vehicle, rigs=rigs)
+    light = None
+    if a.light_camera:
+        fov, pitch, size = a.light_camera.split(":")
+        lh, lw = (int(v) for v in size.lower().split("x"))
+        light = (float(fov), float(pitch), lh, lw)
+    env = CarlaEnv(a.host, a.port, tm_port=a.tm_port, image_size=(h, w), junction_rules=a.junction_rules, light_camera=light, privileged_obs=a.mode == "collect" or a.checkpoint is None, extra_views=views, vehicle=a.vehicle, rigs=rigs)
     try:
         collect(a, env) if a.mode == "collect" else evaluate(a, env)
     finally:

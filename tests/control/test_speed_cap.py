@@ -84,3 +84,37 @@ def test_expert_stops_for_a_yield_line():
     base = dict(t=0.0, speed_mps=6.0, command=Command.LEFT)
     assert p.act(Observation(**base, extras={"lookahead_points": pts})).brake == 0.0
     assert p.act(Observation(**base, extras={"lookahead_points": pts, "yield_distance_m": 8.0})).brake > 0.0
+
+
+def test_expert_start_delay_holds_after_a_green_then_releases():
+    from carlautopilot.core import Command, Observation
+    from carlautopilot.policies import PathFollowPolicy
+
+    pts = [(d, 0.0) for d in (5.0, 10.0, 20.0)]
+    pol = PathFollowPolicy(speed_limit_mps=8.0, start_delay_max_s=2.0, start_delay_seed=3)
+    pol.reset()
+    red = Observation(t=0.0, speed_mps=0.0, command=Command.FOLLOW, extras={"lookahead_points": pts, "next_light_red": True, "next_light_distance_m": 3.5})
+    assert pol.act(red).throttle == 0.0
+    green = lambda t: Observation(t=t, speed_mps=0.0, command=Command.FOLLOW, extras={"lookahead_points": pts, "next_light_red": False, "next_light_distance_m": 3.5})
+    first = pol.act(green(0.05))
+    delay = pol._release_at - 0.05
+    assert 0.0 <= delay <= 2.0
+    if delay > 0.05:
+        assert first.brake == 1.0 and first.throttle == 0.0
+    assert pol.act(green(2.1)).throttle > 0.0
+    assert PathFollowPolicy(speed_limit_mps=8.0).act(green(0.0)).throttle > 0.0
+
+
+def test_model_policy_serves_a_seen_stop_sign_once_then_forgets_it():
+    from carlautopilot.models.route_steering import RouteSteeringNet
+    from carlautopilot.policies.model_policy import ModelPolicy
+
+    pol = ModelPolicy(RouteSteeringNet(predict_speed=True, perceive=True, percept_from_image=True, split_stops=True))
+    pol.reset()
+    assert pol._stop_sign(25.0, 5.0, 0.05) == [25.0]
+    assert pol._stop_sign(7.0, 0.0, 0.5) == [7.0]
+    assert pol._stop_sign(7.0, 0.0, 0.6) == []  # held 1.1 s in the zone: served
+    assert pol._stop_sign(6.0, 0.5, 0.05) == []  # pulling away past the same sign
+    for _ in range(25):
+        pol._stop_sign(40.0, 5.0, 0.05)  # no sign for 1.25 s
+    assert pol._stop_sign(30.0, 5.0, 0.05) == [30.0]  # the next sign must be served again

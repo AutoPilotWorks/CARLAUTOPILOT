@@ -165,3 +165,40 @@ def test_percept_from_image_ignores_speed_and_round_trips(tmp_path):
     train(TrainConfig(str(tmp_path / "data"), ids[:3], ids[3:], str(tmp_path / "out"), epochs=1, predict_speed=True, perceive=True,
                       percept_from_image=True, loss_weights=[1.0, 0.5, 0.5, 0.5, 1.0, 0.05, 0.05, 0.1]))
     assert ModelPolicy.from_checkpoint(tmp_path / "out" / "checkpoint.pt").model.percept_from_image
+
+
+def test_split_stops_trains_eleven_outputs_with_stop_balancing(tmp_path):
+    import numpy as np
+
+    from carlautopilot.policies.model_policy import ModelPolicy
+    from carlautopilot.train.train_steering import stop_weights
+
+    ids = make_episodes(tmp_path / "data", n_episodes=4, steps=6, target_speed=True, perception=True, split_stops=True)
+    with pytest.raises(ValueError):
+        train(TrainConfig(str(tmp_path / "data"), ids[:3], ids[3:], str(tmp_path / "bad"), epochs=1, predict_speed=True, perceive=True,
+                          percept_from_image=True, split_stops=True, loss_weights=[1.0] * 8))
+    train(TrainConfig(str(tmp_path / "data"), ids[:3], ids[3:], str(tmp_path / "out"), epochs=1, predict_speed=True, perceive=True,
+                      percept_from_image=True, split_stops=True, balance_stops=True, loss_weights=[1.0] * 11))
+    pol = ModelPolicy.from_checkpoint(tmp_path / "out" / "checkpoint.pt")
+    assert pol.model.split_stops and pol.model.n_out == 11
+    w = stop_weights(np.array([0.0, 0.0, 0.0, 5.0]), np.array([1, 1, 0, 0]))
+    assert np.allclose(w, [0.5, 0.5, 1.0, 1.0])
+
+
+def test_light_camera_model_trains_and_needs_the_light_image(tmp_path):
+    import torch
+
+    from carlautopilot.models.route_steering import RouteSteeringNet
+    from carlautopilot.policies.model_policy import ModelPolicy
+
+    with pytest.raises(ValueError):
+        RouteSteeringNet(light_camera=True)
+    ids = make_episodes(tmp_path / "data", n_episodes=4, steps=6, target_speed=True, perception=True, split_stops=True, light=True)
+    train(TrainConfig(str(tmp_path / "data"), ids[:3], ids[3:], str(tmp_path / "out"), epochs=1, predict_speed=True, perceive=True,
+                      percept_from_image=True, split_stops=True, light_camera=True, loss_weights=[1.0] * 11))
+    m = ModelPolicy.from_checkpoint(tmp_path / "out" / "checkpoint.pt").model
+    assert m.light_camera
+    x, v, c = torch.zeros(1, 3, 32, 64), torch.zeros(1), torch.zeros(1, dtype=torch.int64)
+    with pytest.raises(ValueError):
+        m(x, v, c)
+    assert m(x, v, c, torch.zeros(1, 3, 16, 32)).shape == (1, 11)

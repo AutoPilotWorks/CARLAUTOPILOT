@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from carlautopilot.core import Action, Env, Observation, Policy
-from carlautopilot.data.episode_store import PERCEPTION_KEYS, write_episode
+from carlautopilot.data.episode_store import PERCEPTION_KEYS, STOP_KEYS, write_episode
 from carlautopilot.models.route_steering import PERCEPT_RANGE_M
 from carlautopilot.scenario import ScenarioSpec
 
@@ -32,6 +32,23 @@ def perception_labels(obs: Observation) -> tuple[float, float, float, float] | N
     d = min(lines) if lines else None
     lead = obs.lead if obs.lead is not None and obs.lead.distance_m < rng else None
     return (float(red), d if red else rng, lead.distance_m if lead else rng, lead.rel_speed_mps if lead else 0.0)
+
+
+def stop_labels(obs: Observation) -> tuple[float, float, float, float, float] | None:
+    """(red light for my lane in range, its stop line m, nearest stop sign m (served or not), yield needed, junction entry m);
+    a distance at PERCEPT_RANGE_M means none in range."""
+    if "lookahead_points" not in obs.extras:
+        return None
+    rng = PERCEPT_RANGE_M
+
+    def near(key):
+        d = obs.extras.get(key)
+        return d if d is not None and d <= rng else None
+
+    red = near("next_light_distance_m") if obs.extras.get("next_light_red") else None
+    sign, yld = near("stop_sign_distance_m"), near("yield_distance_m")
+    return (float(red is not None), rng if red is None else red, rng if sign is None else sign,
+            float(yld is not None), rng if yld is None else yld)
 
 
 def collect_episode(
@@ -66,7 +83,7 @@ def collect_episode(
     rng = np.random.default_rng(noise_seed)
     limit = max_steps if max_steps is not None else int(scenario.max_time_s / env.dt) + 10
     noise = 0.0
-    rows, images, target_speeds, percepts = [], [], [], []
+    rows, images, target_speeds, percepts, stops, lights, light_idx = [], [], [], [], [], [], []
     streams: list[list[np.ndarray]] = []
     termination = None
     for step in range(limit):
@@ -76,12 +93,18 @@ def collect_episode(
             images.append(obs.image)
             target_speeds.append(getattr(expert, "last_target_speed", None))
             percepts.append(perception_labels(obs))
+            stops.append(stop_labels(obs))
+            if "light_image" in obs.extras:
+                lights.append(obs.extras["light_image"])
+            light_idx.append(len(lights) - 1)
             n_before = len(images) - 1
             for img, lab in extra_samples(obs, action) if extra_samples else ():
                 rows.append((obs.t, obs.speed_mps, int(obs.command), lab.steer, lab.throttle, lab.brake))
                 images.append(img)
                 target_speeds.append(target_speeds[-1])
                 percepts.append(percepts[-1])
+                stops.append(stops[-1])
+                light_idx.append(light_idx[-1])
             if stream_images is not None:
                 per_rig = stream_images(obs)
                 if not streams:
@@ -112,6 +135,13 @@ def collect_episode(
     if all(v is not None for v in percepts):
         for k, col in zip(PERCEPTION_KEYS, zip(*percepts)):
             arrays[k] = np.array(col, dtype=np.float32)
+    if all(v is not None for v in stops):
+        for k, col in zip(STOP_KEYS, zip(*stops)):
+            arrays[k] = np.array(col, dtype=np.float32)
+    light_stack = None
+    if lights:
+        arrays["light_idx"] = np.array(light_idx, dtype=np.int64)
+        light_stack = np.stack(lights)
     stack = np.stack(images)
     meta = {
         "scenario_name": scenario.name,
@@ -121,9 +151,9 @@ def collect_episode(
         "image_width": int(stack.shape[2]),
     }
     t_sim = time.perf_counter()
-    write_episode(root, episode_id, meta, arrays, stack, png_compress)
+    write_episode(root, episode_id, meta, arrays, stack, png_compress, light_stack)
     for k, extra_root in enumerate(stream_roots):
-        write_episode(extra_root, episode_id, meta, arrays, np.stack(streams[k]), png_compress)
+        write_episode(extra_root, episode_id, meta, arrays, np.stack(streams[k]), png_compress, light_stack)
     t_end = time.perf_counter()
     return {"episode_id": episode_id, "steps": len(rows), "termination": termination, "sim_s": round(t_sim - t_start, 1), "write_s": round(t_end - t_sim, 1)}
 

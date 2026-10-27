@@ -6,7 +6,7 @@ from carlautopilot.data.episode_store import write_episode
 STEER_BY_COMMAND = {Command.FOLLOW: 0.0, Command.LEFT: -0.5, Command.RIGHT: 0.5, Command.STRAIGHT: 0.0}
 
 
-def make_episodes(root, n_episodes=4, steps=20, h=32, w=64, seed=0, target_speed=False, perception=False):
+def make_episodes(root, n_episodes=4, steps=20, h=32, w=64, seed=0, target_speed=False, perception=False, split_stops=False, light=False):
     rng = np.random.default_rng(seed)
     ids = []
     for e in range(n_episodes):
@@ -28,8 +28,18 @@ def make_episodes(root, n_episodes=4, steps=20, h=32, w=64, seed=0, target_speed
             arrays["light_dist"] = np.where(arrays["light_red"] > 0, 20.0, 50.0).astype(np.float32)
             arrays["lead_dist"] = rng.choice([12.0, 50.0], size=steps).astype(np.float32)
             arrays["lead_rel"] = np.where(arrays["lead_dist"] < 50, -1.0, 0.0).astype(np.float32)
+        if split_stops:
+            arrays["red"] = (rng.random(steps) < 0.3).astype(np.float32)
+            arrays["red_dist"] = np.where(arrays["red"] > 0, 20.0, 40.0).astype(np.float32)
+            arrays["sign_dist"] = rng.choice([8.0, 40.0], size=steps).astype(np.float32)
+            arrays["yield"] = (rng.random(steps) < 0.2).astype(np.float32)
+            arrays["yield_dist"] = np.where(arrays["yield"] > 0, 10.0, 40.0).astype(np.float32)
         images = rng.integers(0, 256, size=(steps, h, w, 3), dtype=np.uint8)
+        light_images = None
+        if light:
+            arrays["light_idx"] = (np.arange(steps) // 2).astype(np.int64)  # two view rows per time step
+            light_images = rng.integers(0, 256, size=(int(arrays["light_idx"][-1]) + 1, 16, 32, 3), dtype=np.uint8)
         meta = {"scenario_name": "synthetic", "seed": seed, "dt": 0.1, "image_height": h, "image_width": w}
-        write_episode(root, eid, meta, arrays, images)
+        write_episode(root, eid, meta, arrays, images, light_images=light_images)
         ids.append(eid)
     return ids

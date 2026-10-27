@@ -14,6 +14,7 @@ from carlautopilot.data.episode_dataset import EpisodeDataset
 from carlautopilot.data.episode_store import list_episodes
 from carlautopilot.data.splits import make_folds
 from carlautopilot.models.route_steering import PERCEPT_RANGE_M, RouteSteeringNet
+from carlautopilot.sim.fake_env import STOP_SIGN_ZONE_M
 
 
 @dataclass
@@ -37,6 +38,9 @@ class TrainConfig:
     perceive: bool = False
     percept_from_image: bool = False
     balance_curves: bool = False
+    split_stops: bool = False
+    balance_stops: bool = False
+    light_camera: bool = False
     loss_weights: list[float] = field(default_factory=lambda: [1.0, 0.5, 0.5])
 
 
@@ -51,7 +55,22 @@ def _resolve_device(name: str) -> torch.device:
     return torch.device(name)
 
 
+def _bce(p: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    p = p.clamp(1e-4, 1 - 1e-4)
+    return -(y * torch.log(p) + (1 - y) * torch.log(1 - p))
+
+
 def _weighted_l1(pred: torch.Tensor, target: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    if pred.shape[1] == 11:
+        # split stops: red BCE, its line only when red, sign distance always (range = none), yield BCE, its entry only
+        # when yielding, lead gap always, relative speed only with a lead
+        red, yld, has_lead = target[:, 4], target[:, 7], (target[:, 9] < PERCEPT_RANGE_M).float()
+        terms = [
+            _bce(pred[:, 4], red), (pred[:, 5] - target[:, 5]).abs() * red, (pred[:, 6] - target[:, 6]).abs(),
+            _bce(pred[:, 7], yld), (pred[:, 8] - target[:, 8]).abs() * yld,
+            (pred[:, 9] - target[:, 9]).abs(), (pred[:, 10] - target[:, 10]).abs() * has_lead,
+        ]
+        return (((pred[:, :4] - target[:, :4]).abs() * w[:4]).sum(dim=1) + sum(w[4 + k] * t for k, t in enumerate(terms))).mean()
     if pred.shape[1] <= 4:
         return ((pred - target).abs() * w).sum(dim=1).mean()
     # perception columns: red-light BCE, stop distance only when red, lead gap always, relative speed only with a lead
@@ -79,6 +98,16 @@ def curve_weights(commands: np.ndarray, target_speed: np.ndarray, slow_mps: floa
     return 1.0 / np.bincount(cell)[cell]
 
 
+STOP_SLOW_MPS = 1.0
+
+
+def stop_weights(speed: np.ndarray, stop_needed: np.ndarray) -> np.ndarray:
+    """Per-sample weights so (standing/moving, stop needed or not) cells are drawn equally often: standing frames are
+    almost all 'stop needed', so a model can say stop for any standstill-looking scene without reading the light."""
+    cell = (speed < STOP_SLOW_MPS) * 2 + stop_needed
+    return 1.0 / np.bincount(cell, minlength=4)[cell]
+
+
 def _run_epoch(model, loader, device, w, optimizer=None, scaler=None) -> float:
     train = optimizer is not None
     model.train(train)
@@ -86,8 +115,9 @@ def _run_epoch(model, loader, device, w, optimizer=None, scaler=None) -> float:
     with torch.set_grad_enabled(train):
         for batch in loader:
             image, speed, command, target = (batch[k].to(device) for k in ("image", "speed", "command", "target"))
+            light = batch["light"].to(device) if "light" in batch else None
             with torch.autocast(device.type, enabled=scaler is not None):
-                loss = _weighted_l1(model(image, speed, command).float(), target, w)
+                loss = _weighted_l1(model(image, speed, command, light).float(), target, w)
             if train:
                 optimizer.zero_grad()
                 if scaler is None:
@@ -108,9 +138,10 @@ def train(cfg: TrainConfig) -> dict:
     last = out / "last.pt"
     if out.exists() and any(out.iterdir()) and not (cfg.resume and last.exists()):
         raise FileExistsError(f"refusing to write into non-empty {out} (use resume to continue from {last.name})")
-    if len(cfg.loss_weights) != (8 if cfg.perceive else 4 if cfg.predict_speed else 3):
+    if len(cfg.loss_weights) != ((11 if cfg.split_stops else 8) if cfg.perceive else 4 if cfg.predict_speed else 3):
         raise ValueError("loss_weights needs 3 values (steer throttle brake), 4 with predict_speed (+ target speed), "
-                         "8 with perceive (+ red light, stop distance, lead gap, lead relative speed)")
+                         "8 with perceive (+ red light, stop distance, lead gap, lead relative speed), 11 with split_stops "
+                         "(+ red, its line, stop sign, yield, its entry, lead gap, lead relative speed)")
     if set(cfg.train_ids) & set(cfg.val_ids):
         raise ValueError("train and validation episodes overlap")
     out.mkdir(parents=True, exist_ok=True)
@@ -119,16 +150,20 @@ def train(cfg: TrainConfig) -> dict:
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
 
-    train_set = EpisodeDataset(cfg.data_root, cfg.train_ids, cfg.cache_dir, cfg.predict_speed, cfg.perceive)
-    val_set = EpisodeDataset(cfg.data_root, cfg.val_ids, cfg.cache_dir, cfg.predict_speed, cfg.perceive)
+    train_set = EpisodeDataset(cfg.data_root, cfg.train_ids, cfg.cache_dir, cfg.predict_speed, cfg.perceive, cfg.split_stops, cfg.light_camera)
+    val_set = EpisodeDataset(cfg.data_root, cfg.val_ids, cfg.cache_dir, cfg.predict_speed, cfg.perceive, cfg.split_stops, cfg.light_camera)
     gen = torch.Generator().manual_seed(cfg.seed)
-    if cfg.balance_commands or cfg.balance_curves:
+    if cfg.balance_commands or cfg.balance_curves or cfg.balance_stops:
         cmds = np.array([int(train_set._arrays[eid]["command"][i]) for eid, i in train_set._index])
         if cfg.balance_curves:
             ts = np.array([float(train_set._arrays[eid]["target_speed"][i]) for eid, i in train_set._index])
             weights = curve_weights(cmds, ts)
         else:
             weights = command_weights(cmds)
+        if cfg.balance_stops:
+            col = lambda k: np.array([float(train_set._arrays[eid][k][i]) for eid, i in train_set._index])
+            needed = ((col("red") > 0.5) | (col("yield") > 0.5) | (col("sign_dist") < STOP_SIGN_ZONE_M)).astype(int)
+            weights = weights * stop_weights(col("speed"), needed)
         sampler = WeightedRandomSampler(weights.tolist(), num_samples=len(cmds), generator=gen)
         train_loader = DataLoader(train_set, batch_size=cfg.batch_size, sampler=sampler, num_workers=cfg.num_workers)
     else:
@@ -136,7 +171,8 @@ def train(cfg: TrainConfig) -> dict:
     val_loader = DataLoader(val_set, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers)
 
     model = RouteSteeringNet(backbone=cfg.backbone, predict_speed=cfg.predict_speed, perceive=cfg.perceive,
-                             percept_from_image=cfg.percept_from_image).to(device)
+                             percept_from_image=cfg.percept_from_image, split_stops=cfg.split_stops,
+                             light_camera=cfg.light_camera).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     scaler = torch.amp.GradScaler("cuda") if cfg.amp and device.type == "cuda" else None
     w = torch.tensor(cfg.loss_weights, dtype=torch.float32, device=device)
@@ -184,6 +220,9 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--balance-curves", action="store_true", help="balance (command, slow bend / fast) cells; needs target_speed labels")
     p.add_argument("--perceive", action="store_true", help="also learn red light / lead from the image (needs --predict-speed)")
     p.add_argument("--percept-from-image", action="store_true", help="perception outputs from the image alone (no speed input)")
+    p.add_argument("--split-stops", action="store_true", help="perception by cause: red light, stop sign, yield (needs --percept-from-image)")
+    p.add_argument("--balance-stops", action="store_true", help="balance (standing/moving, stop needed) cells; needs --split-stops data")
+    p.add_argument("--light-camera", action="store_true", help="feed the traffic-light camera images to the perception head")
     p.add_argument("--balance-commands", action="store_true")
     p.add_argument("--amp", action="store_true", help="mixed precision (CUDA only)")
     p.add_argument("--cache-dir", help="decoded-image cache folder (built on first use; pixels identical to the PNGs)")
@@ -193,8 +232,9 @@ def main(argv: list[str] | None = None) -> None:
     if not 0 <= a.fold < len(folds):
         p.error("--fold is out of range")
     train_ids, val_ids = folds[a.fold]
-    weights = a.loss_weights or ([1.0, 0.5, 0.5, 0.5, 1.0, 0.05, 0.05, 0.1] if a.perceive else [1.0, 0.5, 0.5, 0.5] if a.predict_speed else [1.0, 0.5, 0.5])
-    result = train(TrainConfig(a.data_root, train_ids, val_ids, a.out_dir, a.epochs, a.batch_size, a.lr, a.device, a.seed, a.num_workers, loss_weights=weights, backbone=a.backbone, balance_commands=a.balance_commands, amp=a.amp, cache_dir=a.cache_dir, resume=a.resume, predict_speed=a.predict_speed, perceive=a.perceive, percept_from_image=a.percept_from_image, balance_curves=a.balance_curves))
+    split = [1.0, 0.5, 0.5, 0.5, 1.0, 0.05, 0.05, 1.0, 0.05, 0.05, 0.1]
+    weights = a.loss_weights or ((split if a.split_stops else [1.0, 0.5, 0.5, 0.5, 1.0, 0.05, 0.05, 0.1]) if a.perceive else [1.0, 0.5, 0.5, 0.5] if a.predict_speed else [1.0, 0.5, 0.5])
+    result = train(TrainConfig(a.data_root, train_ids, val_ids, a.out_dir, a.epochs, a.batch_size, a.lr, a.device, a.seed, a.num_workers, loss_weights=weights, backbone=a.backbone, balance_commands=a.balance_commands, amp=a.amp, cache_dir=a.cache_dir, resume=a.resume, predict_speed=a.predict_speed, perceive=a.perceive, percept_from_image=a.percept_from_image, balance_curves=a.balance_curves, split_stops=a.split_stops, balance_stops=a.balance_stops, light_camera=a.light_camera))
     print(json.dumps(result["history"][-1]))
 
 

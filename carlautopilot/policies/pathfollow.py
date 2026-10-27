@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import random
 from dataclasses import dataclass, field
 
 from carlautopilot.control import ACCController, PurePursuit, SafetyConfig, apply_safety
@@ -44,10 +45,17 @@ class PathFollowPolicy:
     lookahead_gain: float = 0.8
     lookahead_offset_m: float = 4.0
     lookahead_min_m: float = 5.0
+    # collection only: after a stop reason clears (light turns green, stop sign served, crossing clear) wait a random
+    # 0..start_delay_max_s like a driver's reaction time; the frames standing at a line with no stop needed are rare
+    # otherwise (97% of standstill frames were labelled stop), and the model learned 'at a stop line => stop'
+    start_delay_max_s: float = 0.0
+    start_delay_seed: int = 0
     name: str = "pathfollow"
 
     def reset(self) -> None:
-        pass
+        self._rng = random.Random(self.start_delay_seed)
+        self._waiting = False
+        self._release_at: float | None = None
 
     def speed_cap(self, points) -> float:
         """Speed limit from the sharpest curvature among the lookahead points (pure-pursuit arc through each)."""
@@ -72,8 +80,26 @@ class PathFollowPolicy:
         for key in ("next_stop_sign_distance_m", "yield_distance_m"):
             if key in obs.extras:
                 stops.append(obs.extras[key])
+        stops = [d for d in stops if d < LIGHT_REACT_DISTANCE_M]
         for dist in stops:
-            if dist < LIGHT_REACT_DISTANCE_M:
-                accel = min(accel, stop_accel(self.acc, obs.speed_mps, dist))
+            accel = min(accel, stop_accel(self.acc, obs.speed_mps, dist))
+        if self.start_delay_max_s > 0:
+            accel = self._delayed_start(obs, bool(stops), accel)
         throttle, brake = self.acc.pedals(accel)
         return apply_safety(Action(steer, throttle, brake), obs, self.safety)
+
+    def _delayed_start(self, obs: Observation, stop_reason: bool, accel: float) -> float:
+        if not hasattr(self, "_rng"):
+            self.reset()
+        standing = obs.speed_mps < 0.3
+        if stop_reason:
+            self._waiting, self._release_at = standing, None
+        elif self._waiting and standing:
+            if self._release_at is None:
+                self._release_at = obs.t + self._rng.uniform(0.0, self.start_delay_max_s)
+            if obs.t < self._release_at:
+                return -self.acc.max_brake_decel
+            self._waiting = False
+        else:
+            self._waiting = False
+        return accel

@@ -22,6 +22,8 @@ LEAD_VISIBLE_M = 100.0
 OFF_ROAD_LATERAL_M = 2.0
 OFF_ROAD_SECONDS = 2.0
 BLOCKED_SPEED_MPS = 0.1
+STOP_SIGN_ZONE_M = 10.0  # a stop counts within this distance before the sign's trigger; IDM halts ~s0 + 3 m = 7 m short of it
+STOP_SIGN_HOLD_S = 1.0
 BLOCKED_SECONDS = 30.0
 RED_LIGHT_SPEED_MPS = 0.5
 ROUTE_END_MARGIN_M = 1.0

@@ -21,6 +21,8 @@ from carlautopilot.sim.fake_env import (
     OFF_ROAD_LATERAL_M,
     OFF_ROAD_SECONDS,
     RED_LIGHT_SPEED_MPS,
+    STOP_SIGN_HOLD_S,
+    STOP_SIGN_ZONE_M,
     _wrap,
 )
 
@@ -30,8 +32,6 @@ VEHICLE = "vehicle.lincoln.mkz_2020"
 # x=4.1 is clean in every view x turn-camera swing. ETS2 masks its cab, so only the road view has to match
 CAB_EYE_X, CAB_EYE_Y, CAB_EYE_Z = 4.1, -0.6, 2.6
 WALKER_CROSS_FACTOR = 0.2
-STOP_SIGN_ZONE_M = 10.0  # a stop counts within this distance before the sign's trigger; IDM halts ~s0 + 3 m = 7 m short of it
-STOP_SIGN_HOLD_S = 1.0
 YIELD_LOOK_M = 30.0  # yield is checked while the junction entry is at most this far ahead
 YIELD_HORIZON_S, YIELD_STEP_S = 4.0, 0.25
 YIELD_MIN_EGO_MPS = 3.0  # a stopped ego is assumed to pull away at this speed when predicting conflicts
@@ -101,6 +101,7 @@ class CarlaEnv:
         vehicle: str = "sedan",
         rigs: tuple[tuple[float, float], ...] = ((90.0, 0.0),),
         junction_rules: bool = False,
+        light_camera: tuple[float, float, int, int] | None = None,
     ):
         """extra_views: additional cameras as (offset left m, yaw left deg); their images go to extras["view_images"].
 
@@ -112,7 +113,14 @@ class CarlaEnv:
         junction_rules: stop signs on the route must be served (halt in STOP_SIGN_ZONE_M for STOP_SIGN_HOLD_S, else a
         STOP_SIGN event), and privileged extras gain next_stop_sign_distance_m and yield_distance_m (junction entry ahead
         while a vehicle/pedestrian is predicted, at constant velocity, to cross the ego's path inside the junction).
+
+        light_camera: (fov deg, pitch up deg, height, width) of a narrow, never-swung camera at the same eye point for
+        traffic lights; its image goes to extras["light_image"] (also without privileged_obs). At 120 deg / 320 px a light
+        head across a junction (~45 m) is ~1x3 px and the model could not read its colour.
         """
+        self.light_camera = light_camera
+        self._light_queue: queue.Queue | None = None
+        self._light_image: np.ndarray | None = None
         self.vehicle = vehicle
         self.junction_rules = junction_rules
         self.blueprint, self.wheelbase_m, self.max_steer_rad, self.cam_x, self.cam_y, self.cam_z = VEHICLES[vehicle]
@@ -237,6 +245,17 @@ class CarlaEnv:
                     self._queues.append(q)
                     self._cams.append((r, dy, dyaw, cam))
                     self._actors.append(cam)
+        self._light_queue = None
+        if self.render_images and self.light_camera:
+            fov, pitch, h, w = self.light_camera
+            bp = bpl.find("sensor.camera.rgb")
+            bp.set_attribute("image_size_x", str(w))
+            bp.set_attribute("image_size_y", str(h))
+            bp.set_attribute("fov", str(fov))
+            cam = self.world.spawn_actor(bp, carla.Transform(carla.Location(x=self.cam_x, y=self.cam_y, z=self.cam_z), carla.Rotation(pitch=pitch)), attach_to=self._ego)
+            self._light_queue = queue.Queue()
+            cam.listen(self._light_queue.put)
+            self._actors.append(cam)
         self._collisions: list = []
         col = self.world.spawn_actor(bpl.find("sensor.other.collision"), carla.Transform(), attach_to=self._ego)
         col.listen(self._collisions.append)
@@ -417,16 +436,20 @@ class CarlaEnv:
                 if rig == r:
                     cam.set_transform(self._mount(dy, dyaw + self._rig_yaw[r]))
 
+    @staticmethod
+    def _read(q: queue.Queue, frame: int) -> np.ndarray:
+        while True:
+            img = q.get(timeout=10.0)
+            if img.frame >= frame:
+                break
+        a = np.frombuffer(img.raw_data, dtype=np.uint8).reshape(img.height, img.width, 4)
+        return np.ascontiguousarray(a[:, :, 2::-1])
+
     def _tick(self) -> None:
         frame = self.world.tick()
-        images = []
-        for q in self._queues:
-            while True:
-                img = q.get(timeout=10.0)
-                if img.frame >= frame:
-                    break
-            a = np.frombuffer(img.raw_data, dtype=np.uint8).reshape(img.height, img.width, 4)
-            images.append(np.ascontiguousarray(a[:, :, 2::-1]))
+        images = [self._read(q, frame) for q in self._queues]
+        if self._light_queue is not None:
+            self._light_image = self._read(self._light_queue, frame)
         if images:
             k = 1 + len(self.extra_views)
             groups = [images[i:i + k] for i in range(0, len(images), k)]
@@ -506,6 +529,10 @@ class CarlaEnv:
             d = self._next_stop_sign()
             if d is not None and d <= LEAD_VISIBLE_M:
                 extras["next_stop_sign_distance_m"] = max(d, 0.0)
+            # every sign ahead, served or not: what the camera sees (the served state is the driver's memory)
+            d = next((ss - self._s for ss in self._stop_signs if ss - self._s > -1.0), None)
+            if d is not None and d <= LEAD_VISIBLE_M:
+                extras["stop_sign_distance_m"] = max(d, 0.0)
             y = self._yield_distance()
             if y is not None:
                 extras["yield_distance_m"] = max(y, 0.0)
@@ -513,7 +540,10 @@ class CarlaEnv:
 
     def _observe(self) -> Observation:
         image = self._last_image if self.render_images else None
-        return Observation(t=self.t, speed_mps=self.v, command=self._command(), image=image, lead=self._lead_info(), extras=self._extras())
+        extras = self._extras()
+        if self._light_queue is not None:
+            extras["light_image"] = self._light_image
+        return Observation(t=self.t, speed_mps=self.v, command=self._command(), image=image, lead=self._lead_info(), extras=extras)
 
     def ground_truth(self) -> GroundTruth:
         return GroundTruth(self.x, self.y, self.yaw, self.v, self._s, self._route.length, self._lat)
