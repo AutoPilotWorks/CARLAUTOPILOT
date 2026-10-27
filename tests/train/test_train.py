@@ -96,3 +96,72 @@ def test_balanced_and_amp_training_runs(tmp_path, device):
     ids = make_episodes(tmp_path / "data", n_episodes=4, steps=6)
     res = train(TrainConfig(str(tmp_path / "data"), ids[:3], ids[3:], str(tmp_path / "out"), epochs=1, device=device, balance_commands=True, amp=True))
     assert res["history"][0]["train_loss"] > 0
+
+
+def test_resume_continues_after_the_last_saved_epoch(tmp_path):
+    ids = make_episodes(tmp_path / "data", n_episodes=4, steps=4)
+    first = train(TrainConfig(str(tmp_path / "data"), ids[:3], ids[3:], str(tmp_path / "out"), epochs=1))
+    assert (tmp_path / "out" / "last.pt").exists()
+    with pytest.raises(FileExistsError):
+        train(TrainConfig(str(tmp_path / "data"), ids[:3], ids[3:], str(tmp_path / "out"), epochs=2))
+    both = train(TrainConfig(str(tmp_path / "data"), ids[:3], ids[3:], str(tmp_path / "out"), epochs=2, resume=True))
+    assert [h["epoch"] for h in both["history"]] == [1, 2]
+    assert both["history"][0] == first["history"][0]
+
+
+def test_predict_speed_trains_a_fourth_output_and_needs_matching_weights(tmp_path):
+    ids = make_episodes(tmp_path / "data", n_episodes=4, steps=4, target_speed=True)
+    with pytest.raises(ValueError):
+        train(TrainConfig(str(tmp_path / "data"), ids[:3], ids[3:], str(tmp_path / "bad"), epochs=1, predict_speed=True))
+    train(TrainConfig(str(tmp_path / "data"), ids[:3], ids[3:], str(tmp_path / "out"), epochs=1, predict_speed=True, loss_weights=[1.0, 0.5, 0.5, 0.5]))
+    from carlautopilot.policies.model_policy import ModelPolicy
+
+    assert ModelPolicy.from_checkpoint(tmp_path / "out" / "checkpoint.pt").model.predict_speed
+
+
+def test_perceive_trains_eight_outputs_with_masked_losses(tmp_path):
+    import torch
+
+    from carlautopilot.train.train_steering import _weighted_l1
+
+    ids = make_episodes(tmp_path / "data", n_episodes=4, steps=4, target_speed=True, perception=True)
+    train(TrainConfig(str(tmp_path / "data"), ids[:3], ids[3:], str(tmp_path / "out"), epochs=1, predict_speed=True, perceive=True,
+                      loss_weights=[1.0, 0.5, 0.5, 0.5, 1.0, 0.05, 0.05, 0.1]))
+    from carlautopilot.policies.model_policy import ModelPolicy
+
+    assert ModelPolicy.from_checkpoint(tmp_path / "out" / "checkpoint.pt").model.perceive
+    w = torch.ones(8)
+    target = torch.tensor([[0.0, 0.0, 0.0, 8.0, 0.0, 50.0, 50.0, 0.0]])
+    pred = target.clone()
+    pred[0, 4], pred[0, 5], pred[0, 7] = 1e-4, 10.0, 3.0  # stop distance and relative speed are ignored here
+    assert _weighted_l1(pred, target, w).item() < 1e-3
+
+
+def test_curve_weights_draw_each_command_speed_cell_equally():
+    import numpy as np
+
+    from carlautopilot.train.train_steering import curve_weights
+
+    cmds = np.array([0] * 8 + [0, 1, 1, 1])
+    ts = np.array([8.0] * 8 + [4.0, 4.0, 8.0, 8.0])
+    w = curve_weights(cmds, ts)
+    cells = cmds * 2 + (ts < 6.0)
+    totals = [w[cells == c].sum() for c in np.unique(cells)]
+    assert np.allclose(totals, 1.0)
+
+
+def test_percept_from_image_ignores_speed_and_round_trips(tmp_path):
+    import torch
+
+    from carlautopilot.models.route_steering import RouteSteeringNet
+    from carlautopilot.policies.model_policy import ModelPolicy
+
+    net = RouteSteeringNet(predict_speed=True, perceive=True, percept_from_image=True).eval()
+    image, command = torch.rand(1, 3, 32, 64), torch.tensor([0])
+    stopped, moving = net(image, torch.tensor([0.0]), command), net(image, torch.tensor([8.0]), command)
+    assert stopped.shape == (1, 8)
+    assert torch.allclose(stopped[:, 4:], moving[:, 4:])  # standing still must not imply 'stop needed'
+    ids = make_episodes(tmp_path / "data", n_episodes=4, steps=4, target_speed=True, perception=True)
+    train(TrainConfig(str(tmp_path / "data"), ids[:3], ids[3:], str(tmp_path / "out"), epochs=1, predict_speed=True, perceive=True,
+                      percept_from_image=True, loss_weights=[1.0, 0.5, 0.5, 0.5, 1.0, 0.05, 0.05, 0.1]))
+    assert ModelPolicy.from_checkpoint(tmp_path / "out" / "checkpoint.pt").model.percept_from_image

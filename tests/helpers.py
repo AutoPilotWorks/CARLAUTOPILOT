@@ -6,7 +6,7 @@ from carlautopilot.data.episode_store import write_episode
 STEER_BY_COMMAND = {Command.FOLLOW: 0.0, Command.LEFT: -0.5, Command.RIGHT: 0.5, Command.STRAIGHT: 0.0}
 
 
-def make_episodes(root, n_episodes=4, steps=20, h=32, w=64, seed=0):
+def make_episodes(root, n_episodes=4, steps=20, h=32, w=64, seed=0, target_speed=False, perception=False):
     rng = np.random.default_rng(seed)
     ids = []
     for e in range(n_episodes):
@@ -21,6 +21,13 @@ def make_episodes(root, n_episodes=4, steps=20, h=32, w=64, seed=0):
             "throttle": np.full(steps, 0.3, dtype=np.float32),
             "brake": np.zeros(steps, dtype=np.float32),
         }
+        if target_speed:
+            arrays["target_speed"] = np.where(command == 0, 8.0, 4.0).astype(np.float32)
+        if perception:
+            arrays["light_red"] = (rng.random(steps) < 0.3).astype(np.float32)
+            arrays["light_dist"] = np.where(arrays["light_red"] > 0, 20.0, 50.0).astype(np.float32)
+            arrays["lead_dist"] = rng.choice([12.0, 50.0], size=steps).astype(np.float32)
+            arrays["lead_rel"] = np.where(arrays["lead_dist"] < 50, -1.0, 0.0).astype(np.float32)
         images = rng.integers(0, 256, size=(steps, h, w, 3), dtype=np.uint8)
         meta = {"scenario_name": "synthetic", "seed": seed, "dt": 0.1, "image_height": h, "image_width": w}
         write_episode(root, eid, meta, arrays, images)

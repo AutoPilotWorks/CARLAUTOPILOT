@@ -7,7 +7,8 @@ import numpy as np
 from PIL import Image
 
 ARRAY_KEYS = ("t", "speed", "command", "steer", "throttle", "brake")
-OPTIONAL_KEYS = ("target_speed",)
+PERCEPTION_KEYS = ("light_red", "light_dist", "lead_dist", "lead_rel")
+OPTIONAL_KEYS = ("target_speed",) + PERCEPTION_KEYS
 META_KEYS = ("scenario_name", "seed", "dt", "image_height", "image_width")
 
 

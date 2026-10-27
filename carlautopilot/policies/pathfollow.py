@@ -10,6 +10,11 @@ LIGHT_STOP_MARGIN_M = 3.0
 LIGHT_REACT_DISTANCE_M = 80.0
 
 
+def stop_accel(acc: ACCController, speed: float, dist: float) -> float:
+    """IDM deceleration toward a stop line dist m ahead, treated as a stationary obstacle."""
+    return acc.idm.accel(speed, max(dist - LIGHT_STOP_MARGIN_M, 0.1), speed)
+
+
 @dataclass
 class ConstantPolicy:
     action: Action = field(default_factory=Action)
@@ -64,11 +69,11 @@ class PathFollowPolicy:
         dist = obs.extras.get("next_light_distance_m")
         if obs.extras.get("next_light_red") and dist is not None:
             stops.append(dist)
-        if "next_stop_sign_distance_m" in obs.extras:
-            stops.append(obs.extras["next_stop_sign_distance_m"])
+        for key in ("next_stop_sign_distance_m", "yield_distance_m"):
+            if key in obs.extras:
+                stops.append(obs.extras[key])
         for dist in stops:
             if dist < LIGHT_REACT_DISTANCE_M:
-                gap = max(dist - LIGHT_STOP_MARGIN_M, 0.1)
-                accel = min(accel, self.acc.idm.accel(obs.speed_mps, gap, obs.speed_mps))
+                accel = min(accel, stop_accel(self.acc, obs.speed_mps, dist))
         throttle, brake = self.acc.pedals(accel)
         return apply_safety(Action(steer, throttle, brake), obs, self.safety)

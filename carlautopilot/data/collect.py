@@ -8,10 +8,30 @@ from pathlib import Path
 import numpy as np
 
 from carlautopilot.core import Action, Env, Observation, Policy
-from carlautopilot.data.episode_store import write_episode
+from carlautopilot.data.episode_store import PERCEPTION_KEYS, write_episode
+from carlautopilot.models.route_steering import PERCEPT_RANGE_M
 from carlautopilot.scenario import ScenarioSpec
 
 NOISE_AR = 0.9
+
+
+def perception_labels(obs: Observation) -> tuple[float, float, float, float] | None:
+    """(must stop at a line in range, distance to it, lead gap, lead relative speed) from privileged observations.
+
+    The stored key is still "light_red": a red light for my lane, an unserved stop sign, or a junction where the
+    expert yields (stop_needed); "light_dist" is the nearest such stop line.
+    """
+    if "lookahead_points" not in obs.extras:
+        return None
+    rng = PERCEPT_RANGE_M
+    lines = [obs.extras.get(k) for k in ("next_stop_sign_distance_m", "yield_distance_m")]
+    if obs.extras.get("next_light_red"):
+        lines.append(obs.extras.get("next_light_distance_m"))
+    lines = [d for d in lines if d is not None and d <= rng]
+    red = bool(lines)
+    d = min(lines) if lines else None
+    lead = obs.lead if obs.lead is not None and obs.lead.distance_m < rng else None
+    return (float(red), d if red else rng, lead.distance_m if lead else rng, lead.rel_speed_mps if lead else 0.0)
 
 
 def collect_episode(
@@ -46,7 +66,7 @@ def collect_episode(
     rng = np.random.default_rng(noise_seed)
     limit = max_steps if max_steps is not None else int(scenario.max_time_s / env.dt) + 10
     noise = 0.0
-    rows, images, target_speeds = [], [], []
+    rows, images, target_speeds, percepts = [], [], [], []
     streams: list[list[np.ndarray]] = []
     termination = None
     for step in range(limit):
@@ -55,11 +75,13 @@ def collect_episode(
             rows.append((obs.t, obs.speed_mps, int(obs.command), action.steer, action.throttle, action.brake))
             images.append(obs.image)
             target_speeds.append(getattr(expert, "last_target_speed", None))
+            percepts.append(perception_labels(obs))
             n_before = len(images) - 1
             for img, lab in extra_samples(obs, action) if extra_samples else ():
                 rows.append((obs.t, obs.speed_mps, int(obs.command), lab.steer, lab.throttle, lab.brake))
                 images.append(img)
                 target_speeds.append(target_speeds[-1])
+                percepts.append(percepts[-1])
             if stream_images is not None:
                 per_rig = stream_images(obs)
                 if not streams:
@@ -87,6 +109,9 @@ def collect_episode(
     }
     if all(v is not None for v in target_speeds):
         arrays["target_speed"] = np.array(target_speeds, dtype=np.float32)
+    if all(v is not None for v in percepts):
+        for k, col in zip(PERCEPTION_KEYS, zip(*percepts)):
+            arrays[k] = np.array(col, dtype=np.float32)
     stack = np.stack(images)
     meta = {
         "scenario_name": scenario.name,

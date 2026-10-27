@@ -170,3 +170,26 @@ def test_image_cache_matches_png_and_png_level_is_lossless(tmp_path):
     meta = {"scenario_name": "x", "seed": 0, "dt": 0.05, "image_height": 8, "image_width": 16}
     write_episode(tmp_path / "p", "lvl1", meta, arrays, imgs, png_compress=1)
     assert all((load_image(tmp_path / "p", "lvl1", i) == imgs[i]).all() for i in range(3))
+
+
+def test_collect_stores_perception_labels_capped_at_range():
+    from carlautopilot.core import LeadInfo, Observation, Command
+    from carlautopilot.data.collect import perception_labels
+
+    base = dict(t=0.0, speed_mps=5.0, command=Command.FOLLOW)
+    assert perception_labels(Observation(**base)) is None
+    far = Observation(**base, lead=LeadInfo(80.0, -1.0), extras={"lookahead_points": [(1.0, 0.0)], "next_light_red": True, "next_light_distance_m": 70.0})
+    assert perception_labels(far) == (0.0, 40.0, 40.0, 0.0)
+    near = Observation(**base, lead=LeadInfo(12.0, -1.5), extras={"lookahead_points": [(1.0, 0.0)], "next_light_red": True, "next_light_distance_m": 20.0})
+    assert perception_labels(near) == (1.0, 20.0, 12.0, -1.5)
+
+
+def test_stop_needed_label_takes_the_nearest_stop_sign_yield_or_red_light():
+    from carlautopilot.core import Command, Observation
+    from carlautopilot.data.collect import perception_labels
+
+    base = dict(t=0.0, speed_mps=5.0, command=Command.FOLLOW)
+    ex = {"lookahead_points": [(1.0, 0.0)], "next_light_red": False, "next_light_distance_m": 10.0}
+    assert perception_labels(Observation(**base, extras=ex))[:2] == (0.0, 40.0)
+    assert perception_labels(Observation(**base, extras={**ex, "yield_distance_m": 15.0, "next_stop_sign_distance_m": 25.0}))[:2] == (1.0, 15.0)
+    assert perception_labels(Observation(**base, extras={**ex, "next_light_red": True, "yield_distance_m": 15.0}))[:2] == (1.0, 10.0)

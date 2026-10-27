@@ -28,17 +28,17 @@ ACC = ACCController(IDM(s0=4.0))  # gaps are measured along the route, so keep a
 def make_scenarios(env: CarlaEnv, a: argparse.Namespace) -> list[ScenarioSpec]:
     rng = random.Random(f"{a.seed}-{a.town}")
     return [
-        env.make_route_scenario(f"{a.town}_{a.seed}_{i:03d}", rng, a.carla_root, npc_vehicles=a.npc, speed_limit_mps=a.speed)
+        env.make_route_scenario(f"{a.town}_{a.seed}_{i:03d}", rng, a.carla_root, npc_vehicles=a.npc, speed_limit_mps=a.speed, npc_walkers=a.walkers)
         for i in range(a.episodes)
     ]
 
 
 # pure-pursuit look-ahead (gain, offset m, min m); the sedan's short one stops junction corner cutting (2026-10-23)
-EXPERT_LOOKAHEAD = {"sedan": (0.5, 2.0, 3.0), "truck": (0.5, 2.0, 3.0)}
+EXPERT_LOOKAHEAD = {"sedan": (0.5, 2.0, 3.0), "truck": (0.5, 2.0, 3.0), "truck_cab": (0.5, 2.0, 3.0)}
 
 
 def expert(speed: float, vehicle: str = "sedan") -> PathFollowPolicy:
-    _, wheelbase, max_steer, _, _ = VEHICLES[vehicle]
+    _, wheelbase, max_steer, _, _, _ = VEHICLES[vehicle]
     gain, offset, minimum = EXPERT_LOOKAHEAD[vehicle]
     return PathFollowPolicy(speed_limit_mps=speed, wheelbase_m=wheelbase, max_steer_rad=max_steer, acc=ACC, max_lat_accel=2.0,
                             lookahead_gain=gain, lookahead_offset_m=offset, lookahead_min_m=minimum)
@@ -104,7 +104,7 @@ def evaluate(a: argparse.Namespace, env: CarlaEnv) -> None:
     else:
         from carlautopilot.policies.model_policy import ModelPolicy
 
-        factory = lambda: ModelPolicy.from_checkpoint(a.checkpoint, speed_limit_mps=a.model_speed, use_model_pedals=a.model_pedals, acc=ACC, turn_speed_mps=a.turn_speed, device=a.device)
+        factory = lambda: ModelPolicy.from_checkpoint(a.checkpoint, speed_limit_mps=a.model_speed, use_model_pedals=a.model_pedals, acc=ACC, turn_speed_mps=a.turn_speed, device=a.device, sim_lead=a.sim_lead)
         title = f"CARLA {a.town}: model {'steer+pedals' if a.model_pedals else 'steer, ACC pedals'}"
     res = run_suite(lambda: env, factory, scs, a.out_dir, title=title)
     print(json.dumps(res["aggregate"], ensure_ascii=False))
@@ -120,10 +120,14 @@ def main(argv: list[str] | None = None) -> None:
         q.add_argument("--town", default="Town10HD_Opt")
         q.add_argument("--episodes", type=int, default=10)
         q.add_argument("--npc", type=int, default=30)
+        q.add_argument("--walkers", type=int, default=0, help="pedestrians with CARLA's walker AI (some cross roads)")
+        q.add_argument("--image-size", default="128x256", help="camera image HxW")
+        q.add_argument("--junction-rules", action="store_true", help="stop signs (served + STOP_SIGN events) and junction yielding")
         q.add_argument("--speed", type=float, default=8.0)
         q.add_argument("--seed", type=int, default=0)
         q.add_argument("--host", default="localhost")
         q.add_argument("--port", type=int, default=2000)
+        q.add_argument("--tm-port", type=int, default=8000, help="Traffic Manager port; give each parallel CARLA server its own")
         q.add_argument("--vehicle", default="sedan", choices=sorted(VEHICLES))
     c = sub.choices["collect"]
     c.add_argument("--data-root", required=True)
@@ -136,16 +140,18 @@ def main(argv: list[str] | None = None) -> None:
     e.add_argument("--out-dir", required=True)
     e.add_argument("--checkpoint")
     e.add_argument("--model-pedals", action="store_true")
-    e.add_argument("--model-speed", type=float, default=6.0, help="ACC speed limit for the model (expert data rarely exceeds ~5-6 m/s)")
-    e.add_argument("--turn-speed", type=float, default=4.5, help="ACC speed cap while the command is LEFT/RIGHT/STRAIGHT (rule)")
+    e.add_argument("--model-speed", type=float, default=6.0, help="ACC speed limit for the model (expert data rarely exceeds ~5-6 m/s); with a predict_speed checkpoint, the road limit above the learned speed")
+    e.add_argument("--turn-speed", type=float, default=4.5, help="ACC speed cap while the command is LEFT/RIGHT/STRAIGHT (rule; ignored by predict_speed checkpoints)")
     e.add_argument("--device", default="cuda", choices=["cpu", "cuda"])
+    e.add_argument("--sim-lead", action="store_true", help="ablation: a perceiving model still gets the simulator's lead vehicle")
     e.add_argument("--fov", type=float, default=90.0)
     e.add_argument("--turn-camera", type=float, default=0.0, help="swing the camera toward LEFT/RIGHT commands by this many degrees")
     a = p.parse_args(argv)
     switch_map(a.town, a.host, a.port)
     views = parse_views(a.views) if a.mode == "collect" else ()
     rigs = (parse_rigs(a.rigs) or ((90.0, 0.0),)) if a.mode == "collect" else ((a.fov, a.turn_camera),)
-    env = CarlaEnv(a.host, a.port, privileged_obs=a.mode == "collect" or a.checkpoint is None, extra_views=views, vehicle=a.vehicle, rigs=rigs)
+    h, w = (int(v) for v in a.image_size.lower().split("x"))
+    env = CarlaEnv(a.host, a.port, tm_port=a.tm_port, image_size=(h, w), junction_rules=a.junction_rules, privileged_obs=a.mode == "collect" or a.checkpoint is None, extra_views=views, vehicle=a.vehicle, rigs=rigs)
     try:
         collect(a, env) if a.mode == "collect" else evaluate(a, env)
     finally:

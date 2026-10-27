@@ -25,12 +25,25 @@ from carlautopilot.sim.fake_env import (
 )
 
 VEHICLE = "vehicle.lincoln.mkz_2020"
+# outside the cab front (face at ~3.97 m): at x=3.0 the steering wheel shows and at x=3.5 the wipers, mirror and
+# cab body show in the side-shifted/rotated views, all of which leak the steering label (v1.8 collapsed on it);
+# x=4.1 is clean in every view x turn-camera swing. ETS2 masks its cab, so only the road view has to match
+CAB_EYE_X, CAB_EYE_Y, CAB_EYE_Z = 4.1, -0.6, 2.6
+WALKER_CROSS_FACTOR = 0.2
+STOP_SIGN_ZONE_M = 10.0  # a stop counts within this distance before the sign's trigger; IDM halts ~s0 + 3 m = 7 m short of it
+STOP_SIGN_HOLD_S = 1.0
+YIELD_LOOK_M = 30.0  # yield is checked while the junction entry is at most this far ahead
+YIELD_HORIZON_S, YIELD_STEP_S = 4.0, 0.25
+YIELD_MIN_EGO_MPS = 3.0  # a stopped ego is assumed to pull away at this speed when predicting conflicts
+YIELD_CLEAR_M = {"vehicle": 2.8, "walker": 2.0}
 WHEELBASE_M = 2.86
 MAX_STEER_RAD = math.radians(70.0)
-# name -> (blueprint, wheelbase m, max front-wheel steer rad, camera x m, camera z m); measured 2026-10-21/24
+# name -> (blueprint, wheelbase m, max front-wheel steer rad, camera x m, camera y m (CARLA, + right), camera z m)
+# measured 2026-10-21/24; truck_cab puts the camera at the left-hand driver's eye, like ETS2's interior view
 VEHICLES = {
-    "sedan": (VEHICLE, WHEELBASE_M, MAX_STEER_RAD, 1.5, 1.6),
-    "truck": ("vehicle.carlamotors.european_hgv", 4.42, math.radians(70.0), 4.1, 2.4),
+    "sedan": (VEHICLE, WHEELBASE_M, MAX_STEER_RAD, 1.5, 0.0, 1.6),
+    "truck": ("vehicle.carlamotors.european_hgv", 4.42, math.radians(70.0), 4.1, 0.0, 2.4),
+    "truck_cab": ("vehicle.carlamotors.european_hgv", 4.42, math.radians(70.0), CAB_EYE_X, CAB_EYE_Y, CAB_EYE_Z),
 }
 TURN_CAMERA_RATE_DEG_S = 25.0
 ROUTE_END_MARGIN_M = 2.0
@@ -87,6 +100,7 @@ class CarlaEnv:
         follow_spectator: bool = True,
         vehicle: str = "sedan",
         rigs: tuple[tuple[float, float], ...] = ((90.0, 0.0),),
+        junction_rules: bool = False,
     ):
         """extra_views: additional cameras as (offset left m, yaw left deg); their images go to extras["view_images"].
 
@@ -94,9 +108,14 @@ class CarlaEnv:
         camera plus extra_views, and rigs 1.. go to extras["rig_images"] as [centre, *views]. A nonzero turn camera angle
         swings the whole rig toward the route command (LEFT +, RIGHT -) at TURN_CAMERA_RATE_DEG_S; labels do not change
         because the vehicle pose does not.
+
+        junction_rules: stop signs on the route must be served (halt in STOP_SIGN_ZONE_M for STOP_SIGN_HOLD_S, else a
+        STOP_SIGN event), and privileged extras gain next_stop_sign_distance_m and yield_distance_m (junction entry ahead
+        while a vehicle/pedestrian is predicted, at constant velocity, to cross the ego's path inside the junction).
         """
         self.vehicle = vehicle
-        self.blueprint, self.wheelbase_m, self.max_steer_rad, self.cam_x, self.cam_z = VEHICLES[vehicle]
+        self.junction_rules = junction_rules
+        self.blueprint, self.wheelbase_m, self.max_steer_rad, self.cam_x, self.cam_y, self.cam_z = VEHICLES[vehicle]
         self.rigs = tuple(rigs)
         self.dt = dt
         self.extra_views = tuple(extra_views)
@@ -142,6 +161,7 @@ class CarlaEnv:
         max_len_m: float = 600.0,
         npc_vehicles: int = 30,
         speed_limit_mps: float = 8.0,
+        npc_walkers: int = 0,
         max_tries: int = 200,
     ) -> ScenarioSpec:
         """Random A->B route from CARLA's GlobalRoutePlanner, with junction commands."""
@@ -178,6 +198,7 @@ class CarlaEnv:
                     "town": cmap.name.split("/")[-1],
                     "start": [start.location.x, start.location.y, start.location.z, start.rotation.yaw],
                     "npc_vehicles": npc_vehicles,
+                    "npc_walkers": npc_walkers,
                     "weather": rng.choice(WEATHERS),
                 },
             )
@@ -222,10 +243,15 @@ class CarlaEnv:
         self._actors.append(col)
 
         self._spawn_npcs(rng, int(meta.get("npc_vehicles", 0)), start.location)
+        self._spawn_walkers(seed, int(meta.get("npc_walkers", 0)), start.location)
 
         self._scenario = scenario
         self._route = WindowedRoute([(w.x, w.y) for w in scenario.route])
         self._lights = self._lights_on_route()
+        self._stop_signs = self._stop_signs_on_route() if self.junction_rules else []
+        self._stop_served: set[int] = set()
+        self._stop_hold = 0.0
+        self._junctions = self._junctions_on_route() if self.junction_rules else []
         self._light_events_done: set[int] = set()
         self._s = 0.0
         self.t = 0.0
@@ -251,6 +277,36 @@ class CarlaEnv:
                 npc.set_autopilot(True, self.tm_port)
                 self._npcs.append(npc.id)
 
+    def _spawn_walkers(self, seed: int, n: int, ego_loc) -> None:
+        if n <= 0:
+            return
+        bpl = self.world.get_blueprint_library()
+        rng = random.Random(seed + 1)
+        self.world.set_pedestrians_seed(seed)
+        self.world.set_pedestrians_cross_factor(WALKER_CROSS_FACTOR)
+        walkers = []
+        for _ in range(n * 2):
+            if len(walkers) >= n:
+                break
+            loc = self.world.get_random_location_from_navigation()
+            if loc is None or loc.distance(ego_loc) < 10.0:
+                continue
+            bp = rng.choice(bpl.filter("walker.pedestrian.*"))
+            if bp.has_attribute("is_invincible"):
+                bp.set_attribute("is_invincible", "false")
+            w = self.world.try_spawn_actor(bp, carla.Transform(loc + carla.Location(z=1.0)))
+            if w is not None:
+                walkers.append(w)
+                self._actors.append(w)
+        self.world.tick()
+        ctrl_bp = bpl.find("controller.ai.walker")
+        for w in walkers:
+            c = self.world.spawn_actor(ctrl_bp, carla.Transform(), attach_to=w)
+            self._actors.append(c)
+            c.start()
+            c.go_to_location(self.world.get_random_location_from_navigation())
+            c.set_max_speed(1.0 + rng.random())
+
     def _lights_on_route(self) -> list[tuple[float, object]]:
         found = []
         for light in self.world.get_actors().filter("traffic.traffic_light"):
@@ -262,8 +318,92 @@ class CarlaEnv:
                     found.append((s, light))
         return sorted(found, key=lambda f: f[0])
 
+    def _stop_signs_on_route(self) -> list[float]:
+        cmap = self.world.get_map()
+        found = []
+        for sign in self.world.get_actors().filter("traffic.stop"):
+            loc = sign.get_transform().transform(sign.trigger_volume.location)
+            wp = cmap.get_waypoint(loc)
+            lx, ly = carla_to_xy(wp.transform.location.x, wp.transform.location.y)
+            s, _, dist = self._route.project(lx, ly)
+            heading = carla_yaw_to_rad(wp.transform.rotation.yaw)
+            if dist < LIGHT_MATCH_M and abs(_wrap(heading - self._route.heading_at(s))) < math.radians(30):
+                found.append(s)
+        return sorted(found)
+
+    def _junctions_on_route(self) -> list[tuple[float, float]]:
+        cmap = self.world.get_map()
+        spans, start = [], None
+        n = int(self._route.length // 2.0) + 1
+        for i in range(n + 1):
+            s = min(i * 2.0, self._route.length)
+            x, y = self._route.point_at(s)
+            inside = cmap.get_waypoint(carla.Location(x=x, y=-y, z=0.0)).is_junction
+            if inside and start is None:
+                start = s
+            elif not inside and start is not None:
+                spans.append((start, s))
+                start = None
+        if start is not None:
+            spans.append((start, self._route.length))
+        return spans
+
+    def _next_stop_sign(self) -> float | None:
+        for i, ss in enumerate(self._stop_signs):
+            if i not in self._stop_served and ss - self._s > -1.0:
+                return ss - self._s
+        return None
+
+    def _serve_stop_signs(self) -> list[Event]:
+        events = []
+        for i, ss in enumerate(self._stop_signs):
+            if i in self._stop_served:
+                continue
+            d = ss - self._s
+            if d < -1.0:
+                self._stop_served.add(i)
+                events.append(Event(self.t, EventKind.STOP_SIGN, f"stop sign at s={ss:.0f}"))
+            elif d <= STOP_SIGN_ZONE_M and self.v < BLOCKED_SPEED_MPS:
+                self._stop_hold += self.dt
+                if self._stop_hold >= STOP_SIGN_HOLD_S:
+                    self._stop_served.add(i)
+                    self._stop_hold = 0.0
+            break
+        return events
+
+    def _yield_distance(self) -> float | None:
+        entry = next((a for a, b in self._junctions if a - self._s > -0.5), None)
+        if entry is None or entry - self._s > YIELD_LOOK_M:
+            return None
+        v = max(self.v, YIELD_MIN_EGO_MPS)
+        steps = [k * YIELD_STEP_S for k in range(int(YIELD_HORIZON_S / YIELD_STEP_S) + 1)]
+        ego = [(t, self._route.point_at(self._s + v * t)) for t in steps if self._s + v * t >= entry - 2.0]
+        if not ego:
+            return None
+        reach = v * YIELD_HORIZON_S + 40.0
+        for kind in ("vehicle", "walker"):
+            for a in self.world.get_actors().filter(f"{kind}.*"):
+                if a.id == self._ego.id:
+                    continue
+                loc = a.get_location()
+                ox, oy = carla_to_xy(loc.x, loc.y)
+                if math.hypot(ox - self.x, oy - self.y) > reach:
+                    continue
+                vel = a.get_velocity()
+                vx, vy = carla_to_xy(vel.x, vel.y)
+                if kind == "vehicle":
+                    s, lat, _ = self._route.project(ox, oy, self._s, self._s + reach)
+                    if abs(lat) < CORRIDOR_HALF_M and math.cos(math.atan2(vy, vx) - self._route.heading_at(s)) > 0.87 and math.hypot(vx, vy) > 0.5:
+                        continue  # same lane, same direction: the ACC lead, not a crossing conflict
+                clear = YIELD_CLEAR_M[kind]
+                hit = next((t for t, (ex, ey) in ego if math.hypot(ox + vx * t - ex, oy + vy * t - ey) < clear), None)
+                if hit is not None:
+                    self.yield_reason = (a.type_id, round(math.hypot(vx, vy), 1), round(math.hypot(ox - self.x, oy - self.y), 1), hit)
+                    return entry - self._s
+        return None
+
     def _mount(self, dy: float, dyaw: float):
-        return carla.Transform(carla.Location(x=self.cam_x, y=-dy, z=self.cam_z), carla.Rotation(yaw=-dyaw))
+        return carla.Transform(carla.Location(x=self.cam_x, y=self.cam_y - dy, z=self.cam_z), carla.Rotation(yaw=-dyaw))
 
     def _swing_turn_cameras(self) -> None:
         cmd = self._command()
@@ -362,6 +502,13 @@ class CarlaEnv:
                 extras["next_light_distance_m"] = dist
                 extras["next_light_red"] = light.get_state() in (carla.TrafficLightState.Red, carla.TrafficLightState.Yellow)
                 break
+        if self.junction_rules:
+            d = self._next_stop_sign()
+            if d is not None and d <= LEAD_VISIBLE_M:
+                extras["next_stop_sign_distance_m"] = max(d, 0.0)
+            y = self._yield_distance()
+            if y is not None:
+                extras["yield_distance_m"] = max(y, 0.0)
         return extras
 
     def _observe(self) -> Observation:
@@ -407,6 +554,8 @@ class CarlaEnv:
                 events.append(Event(self.t, EventKind.RED_LIGHT, f"light {light.id}"))
                 self._light_events_done.add(i)
 
+        if self.junction_rules:
+            events += self._serve_stop_signs()
         self._off_road_time = self._off_road_time + self.dt if abs(self._lat) > OFF_ROAD_LATERAL_M else 0.0
         if termination is None and self._off_road_time >= OFF_ROAD_SECONDS:
             events.append(Event(self.t, EventKind.OFF_ROAD, f"lateral {self._lat:.2f} m"))
@@ -428,7 +577,7 @@ class CarlaEnv:
             self.client.apply_batch_sync([carla.command.DestroyActor(i) for i in self._npcs], True)
             self._npcs = []
         for a in reversed(self._actors):
-            if a.type_id.startswith("sensor."):
+            if a.type_id.startswith(("sensor.", "controller.")):
                 a.stop()
             a.destroy()
         self._actors = []
