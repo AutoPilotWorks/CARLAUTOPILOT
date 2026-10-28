@@ -202,3 +202,10 @@ def test_light_camera_model_trains_and_needs_the_light_image(tmp_path):
     with pytest.raises(ValueError):
         m(x, v, c)
     assert m(x, v, c, torch.zeros(1, 3, 16, 32)).shape == (1, 11)
+    # P(red) (column 4) comes from the light image alone: v1.10 read it off the main view and ignored the light camera
+    m.eval()
+    light = torch.rand(2, 3, 16, 32)
+    with torch.no_grad():
+        a, b = m(torch.zeros(2, 3, 32, 64), v.expand(2), c.expand(2), light), m(torch.rand(2, 3, 32, 64), v.expand(2), c.expand(2), light)
+        assert torch.allclose(a[:, 4], b[:, 4]) and not torch.allclose(a[:, 5:], b[:, 5:])
+        assert not torch.allclose(a[:, 4], m(torch.zeros(2, 3, 32, 64), v.expand(2), c.expand(2), light.flip(0))[:, 4])

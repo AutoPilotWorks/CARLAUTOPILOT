@@ -20,6 +20,19 @@ def _resnet18(feature_dim: int, pretrained: bool) -> nn.Module:
     return nn.Sequential(_Normalize(mean, std), net)
 
 
+def _light_net(pretrained: bool) -> nn.Module:
+    """Traffic-light camera features: ResNet18 up to layer2 (stride 8, batch-normed, ImageNet colour/edge filters), then a
+    4x8 grid of per-cell max pools. One max over the whole frame was a constant (sky and bright walls win it, 2026-10-27)."""
+    from torchvision.models import ResNet18_Weights, resnet18
+
+    net = resnet18(weights=ResNet18_Weights.DEFAULT if pretrained else None)
+    mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+    return nn.Sequential(_Normalize(mean, std), net.conv1, net.bn1, net.relu, net.maxpool, net.layer1, net.layer2,
+                         nn.Conv2d(128, 32, 1), nn.ReLU(), nn.AdaptiveMaxPool2d((4, 8)), nn.Flatten(),
+                         nn.Linear(32 * 32, 64), nn.ReLU())
+
+
 class _Normalize(nn.Module):
     def __init__(self, mean: torch.Tensor, std: torch.Tensor):
         super().__init__()
@@ -42,8 +55,9 @@ class RouteSteeringNet(nn.Module):
     split_stops (needs percept_from_image) replaces those 4 with 7 by cause: P(red light), its stop line m, nearest stop
     sign m (served or not; PERCEPT_RANGE_M = none), P(yield), junction entry m, lead gap m, lead relative speed m/s.
     One merged 'stop needed' let the model stop at any stop line look and never restart after a stop sign.
-    light_camera (needs percept_from_image) adds a second, narrow image for traffic lights: a small full-resolution CNN
-    with max pooling (a light head is a few pixels; average pooling would wash it out) feeds only the perception head.
+    light_camera (needs percept_from_image) adds a second, narrow image for traffic lights (see _light_net). P(red light)
+    comes from those light features alone; the other perception outputs see both images. With P(red) also fed the main
+    image, v1.10 learned 'stop line / junction ahead => red' (68% right) and ignored the light image completely.
     """
 
     def __init__(self, feature_dim: int = 128, backbone: str = "small", pretrained: bool = True, predict_speed: bool = False,
@@ -92,12 +106,8 @@ class RouteSteeringNet(nn.Module):
             light_dim = 64 if light_camera else 0
             self.percept = nn.Sequential(nn.Linear(feature_dim + light_dim, 64), nn.ReLU(), nn.Linear(64, n_percept))
         if light_camera:
-            self.light_net = nn.Sequential(
-                nn.Conv2d(3, 16, 3, padding=1), nn.ReLU(),
-                nn.Conv2d(16, 32, 3, stride=2, padding=1), nn.ReLU(),
-                nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.ReLU(),
-                nn.AdaptiveMaxPool2d((2, 4)), nn.Flatten(), nn.Linear(64 * 8, 64), nn.ReLU(),
-            )
+            self.light_net = _light_net(pretrained)
+            self.light_red = nn.Linear(64, 1)
 
     def forward(self, image: torch.Tensor, speed: torch.Tensor, command: torch.Tensor, light: torch.Tensor | None = None) -> torch.Tensor:
         img = self.backbone(image)
@@ -109,10 +119,12 @@ class RouteSteeringNet(nn.Module):
             if self.light_camera:
                 if light is None:
                     raise ValueError("this model needs the traffic-light camera image")
-                pin = torch.cat([img, self.light_net(light)], dim=1)
+                lf = self.light_net(light)
+                p = self.percept(torch.cat([img, lf], dim=1))
+                p = torch.cat([self.light_red(lf), p[:, 1:]], dim=1)  # column 0 is P(red) in both percept layouts
             else:
-                pin = img
-            raw = torch.cat([raw, self.percept(pin)], dim=1)
+                p = self.percept(img)
+            raw = torch.cat([raw, p], dim=1)
         out = [torch.tanh(raw[:, :1]), torch.sigmoid(raw[:, 1:3])]
         if self.predict_speed:
             out.append(nn.functional.softplus(raw[:, 3:4]))
