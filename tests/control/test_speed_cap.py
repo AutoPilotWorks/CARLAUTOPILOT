@@ -118,3 +118,13 @@ def test_model_policy_serves_a_seen_stop_sign_once_then_forgets_it():
     for _ in range(25):
         pol._stop_sign(40.0, 5.0, 0.05)  # no sign for 1.25 s
     assert pol._stop_sign(30.0, 5.0, 0.05) == [30.0]  # the next sign must be served again
+
+
+def test_model_policy_holds_at_a_red_light_once_standing():
+    from carlautopilot.policies.model_policy import ModelPolicy
+    from carlautopilot.policies.pathfollow import LIGHT_STOP_MARGIN_M
+
+    assert ModelPolicy._red_stop(0.9, 20.0, 5.0, True) == [20.0]  # approaching: stop at the predicted line
+    assert ModelPolicy._red_stop(0.9, 15.0, 0.0, True) == [LIGHT_STOP_MARGIN_M]  # standing: hold, whatever the distance says
+    assert ModelPolicy._red_stop(0.3, 15.0, 0.0, True) == []  # no longer red: go
+    assert ModelPolicy._red_stop(0.9, 15.0, 0.0, False) == [15.0]  # default: always the predicted line

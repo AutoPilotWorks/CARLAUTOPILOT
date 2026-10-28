@@ -43,3 +43,15 @@ def test_cli_and_empty_log(tmp_path):
     empty.write_text('{"scenario_name":"x","seed":0,"dt":0.05,"policy_name":"p","schema_version":1}\n', encoding="utf-8")
     with pytest.raises(ValueError):
         plot_log(empty, tmp_path / "e.png")
+
+
+def test_run_episode_saves_frames_before_an_event(tmp_path):
+    from carlautopilot.core import Action
+    from carlautopilot.policies import ConstantPolicy
+
+    d = tmp_path / "frames"
+    r = run_episode(FakeEnv(render_images=True), ConstantPolicy(Action(0.0, 0.6, 0.0)), red_light(), frames_dir=d)
+    kinds = [e.kind for rec in r.records for e in rec.events]
+    assert "red_light" in kinds
+    shots = sorted(p for p in d.iterdir() if p.name.endswith("_red_light"))
+    assert shots and 0 < len(list(shots[0].glob("*_main.png"))) <= 20

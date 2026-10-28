@@ -19,7 +19,7 @@
 - 정책은 `Observation`만 본다. `GroundTruth`는 평가 전용이다(정책에 주지 않는다). 예외: 가짜 환경의 기준 정책 시험용으로 `Observation.extras`에 특권 정보를 넣는 옵션이 있다.
 
 ## 에피소드 로그 형식 (JSON Lines)
-첫 줄은 `EpisodeHeader`(`scenario_name`, `seed`, `dt`, `policy_name`, `schema_version`), 이후 한 줄에 `StepRecord` 하나(`step`, `t`, `speed_mps`, `command`, `action`, `truth`, `events`, `lead_distance_m`). 쓰기와 읽기는 `carlautopilot/eval/episode_log.py`가 맡는다.
+첫 줄은 `EpisodeHeader`(`scenario_name`, `seed`, `dt`, `policy_name`, `schema_version`), 이후 한 줄에 `StepRecord` 하나(`step`, `t`, `speed_mps`, `command`, `action`, `truth`, `events`, `lead_distance_m`, 모델 정책일 때 `percept`). `truth`에는 CARLA에서 다음 신호의 정지선까지 경로 거리와 빨간불(노란불 포함) 여부(`next_light_m`, `next_light_red`)가 들어간다. 두 필드는 2026-10-28에 더했고, 없는 옛 기록도 읽힌다. 쓰기와 읽기는 `carlautopilot/eval/episode_log.py`가 맡는다.
 
 ## 평가 지표 (프로젝트 정의, CARLA 리더보드 값이 아님)
 - `route_completion` = clamp(최대 `route_progress_m` / `route_length_m`, 0, 1). 환경이 `route_complete`로 종료한 에피소드는 정확히 1.0으로 본다(환경이 경로 끝 근처의 허용 오차 안에서 완주로 판정하기 때문).

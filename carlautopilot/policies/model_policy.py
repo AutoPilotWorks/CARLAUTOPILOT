@@ -9,7 +9,7 @@ import torch
 from carlautopilot.control import ACCController, SafetyConfig, apply_safety
 from carlautopilot.core import Action, Command, LeadInfo, Observation
 from carlautopilot.models.route_steering import PERCEPT_RANGE_M, RouteSteeringNet
-from carlautopilot.policies.pathfollow import stop_accel
+from carlautopilot.policies.pathfollow import LIGHT_STOP_MARGIN_M, stop_accel
 from carlautopilot.sim.fake_env import BLOCKED_SPEED_MPS, STOP_SIGN_HOLD_S, STOP_SIGN_ZONE_M
 
 SIGN_RESET_S = 1.0  # a served stop sign is forgotten once no sign is seen near (within the zone + 5 m) for this long
@@ -32,6 +32,7 @@ class ModelPolicy:
     use_model_pedals: bool = False
     turn_speed_mps: float | None = None
     sim_lead: bool = False  # ablation: keep the simulator's lead even when the model perceives one
+    red_hold: bool = False  # rule, off by default: once standing at a seen red, hold until it is no longer seen red
     acc: ACCController = field(default_factory=ACCController)
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     device: str = "cpu"
@@ -73,9 +74,8 @@ class ModelPolicy:
         self._last_t = obs.t
         stops: list[float] = []
         if self.model.split_stops:
-            p_red, red_d, sign_d, p_yield, yield_d, lead_d, lead_rel = (float(v) for v in out[4:11])
-            if p_red > 0.5:
-                stops.append(red_d)
+            p_red, red_d, sign_d, p_yield, yield_d, lead_d, lead_rel = self.last_percept = tuple(float(v) for v in out[4:11])
+            stops += self._red_stop(p_red, red_d, obs.speed_mps, self.red_hold)
             if p_yield > 0.5:
                 stops.append(yield_d)
             stops += self._stop_sign(sign_d, obs.speed_mps, dt)
@@ -101,6 +101,15 @@ class ModelPolicy:
                 accel = min(accel, stop_accel(self.acc, obs.speed_mps, d))
             throttle, brake = self.acc.pedals(accel)
         return apply_safety(Action(steer, throttle, brake), obs, self.safety)
+
+    @staticmethod
+    def _red_stop(p_red: float, red_d: float, speed: float, hold: bool) -> list[float]:
+        """Stop line for a seen red light. With hold, once standing at a red, stay until the light is no longer seen red: close to
+        the line the predicted distance jumped (6 m -> 15 m) and released the truck on red (Town02, 2026-10-28). On v1.10c it cut
+        red violations 39 -> 28 but a green seen late kept the truck standing (completions 31 -> 28), so it is off by default."""
+        if p_red <= 0.5:
+            return []
+        return [LIGHT_STOP_MARGIN_M] if hold and speed < BLOCKED_SPEED_MPS else [red_d]
 
     def _stop_sign(self, sign_d: float, speed: float, dt: float) -> list[float]:
         """Stop line for a seen, not yet served stop sign (empty when none or served)."""

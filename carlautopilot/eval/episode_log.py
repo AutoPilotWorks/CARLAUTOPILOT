@@ -19,6 +19,7 @@ def _record_to_dict(r: StepRecord) -> dict:
         "truth": asdict(r.truth),
         "events": [asdict(e) for e in r.events],
         "lead_distance_m": r.lead_distance_m,
+        **({} if r.percept is None else {"percept": list(r.percept)}),
     }
 
 
@@ -32,6 +33,7 @@ def _record_from_dict(d: dict) -> StepRecord:
         truth=GroundTruth(**d["truth"]),
         events=tuple(Event(**e) for e in d.get("events", [])),
         lead_distance_m=None if d.get("lead_distance_m") is None else float(d["lead_distance_m"]),
+        percept=None if d.get("percept") is None else tuple(d["percept"]),
     )
 
 

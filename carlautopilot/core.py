@@ -75,6 +75,8 @@ class GroundTruth:
     route_progress_m: float
     route_length_m: float
     lateral_error_m: float
+    next_light_m: float | None = None  # route distance to the next traffic light's stop line (logged for diagnosis)
+    next_light_red: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -100,6 +102,7 @@ class StepRecord:
     truth: GroundTruth
     events: tuple[Event, ...] = ()
     lead_distance_m: float | None = None
+    percept: tuple[float, ...] | None = None  # model perception outputs this step (ModelPolicy.last_percept)
 
 
 @dataclass(frozen=True)

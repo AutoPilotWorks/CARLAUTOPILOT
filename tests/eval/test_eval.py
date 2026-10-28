@@ -1,3 +1,4 @@
+from dataclasses import replace
 import json
 
 import pytest
@@ -24,6 +25,7 @@ def full_run(events_at=None):
 def test_roundtrip(tmp_path):
     p = tmp_path / "ep.jsonl"
     records = [rec(0, 1.0, 0.0, lead=None), rec(1, 2.0, 1.0, events=[Event(0.5, EventKind.RED_LIGHT, "x")], lead=12.5)]
+    records[1] = replace(records[1], percept=(0.9, 7.5), truth=replace(records[1].truth, next_light_m=7.5, next_light_red=True))
     with EpisodeLogWriter(p) as w:
         w.write_header(HEADER)
         for r in records:

@@ -546,7 +546,9 @@ class CarlaEnv:
         return Observation(t=self.t, speed_mps=self.v, command=self._command(), image=image, lead=self._lead_info(), extras=extras)
 
     def ground_truth(self) -> GroundTruth:
-        return GroundTruth(self.x, self.y, self.yaw, self.v, self._s, self._route.length, self._lat)
+        nxt = next(((ls - self._s, light) for ls, light in self._lights if 0.0 < ls - self._s <= LEAD_VISIBLE_M), None)
+        red = None if nxt is None else nxt[1].get_state() in (carla.TrafficLightState.Red, carla.TrafficLightState.Yellow)
+        return GroundTruth(self.x, self.y, self.yaw, self.v, self._s, self._route.length, self._lat, None if nxt is None else nxt[0], red)
 
     def step(self, action: Action) -> StepResult:
         if self._scenario is None:

@@ -41,6 +41,7 @@ class TrainConfig:
     split_stops: bool = False
     balance_stops: bool = False
     light_camera: bool = False
+    boost_red_approach: float = 1.0
     loss_weights: list[float] = field(default_factory=lambda: [1.0, 0.5, 0.5])
 
 
@@ -108,6 +109,15 @@ def stop_weights(speed: np.ndarray, stop_needed: np.ndarray) -> np.ndarray:
     return 1.0 / np.bincount(cell, minlength=4)[cell]
 
 
+RED_APPROACH_M = 30.0
+
+
+def red_approach_weights(red: np.ndarray, speed: np.ndarray, red_dist: np.ndarray, boost: float) -> np.ndarray:
+    """boost for frames driving up to a red light within RED_APPROACH_M: where v1.10c misjudged the stop line by +5 m in an
+    unseen town and braked too late (Town02, 2026-10-28)."""
+    return np.where((red > 0.5) & (speed >= STOP_SLOW_MPS) & (red_dist < RED_APPROACH_M), boost, 1.0)
+
+
 def _run_epoch(model, loader, device, w, optimizer=None, scaler=None) -> float:
     train = optimizer is not None
     model.train(train)
@@ -153,7 +163,7 @@ def train(cfg: TrainConfig) -> dict:
     train_set = EpisodeDataset(cfg.data_root, cfg.train_ids, cfg.cache_dir, cfg.predict_speed, cfg.perceive, cfg.split_stops, cfg.light_camera)
     val_set = EpisodeDataset(cfg.data_root, cfg.val_ids, cfg.cache_dir, cfg.predict_speed, cfg.perceive, cfg.split_stops, cfg.light_camera)
     gen = torch.Generator().manual_seed(cfg.seed)
-    if cfg.balance_commands or cfg.balance_curves or cfg.balance_stops:
+    if cfg.balance_commands or cfg.balance_curves or cfg.balance_stops or cfg.boost_red_approach != 1.0:
         cmds = np.array([int(train_set._arrays[eid]["command"][i]) for eid, i in train_set._index])
         if cfg.balance_curves:
             ts = np.array([float(train_set._arrays[eid]["target_speed"][i]) for eid, i in train_set._index])
@@ -164,6 +174,9 @@ def train(cfg: TrainConfig) -> dict:
             col = lambda k: np.array([float(train_set._arrays[eid][k][i]) for eid, i in train_set._index])
             needed = ((col("red") > 0.5) | (col("yield") > 0.5) | (col("sign_dist") < STOP_SIGN_ZONE_M)).astype(int)
             weights = weights * stop_weights(col("speed"), needed)
+        if cfg.boost_red_approach != 1.0:
+            col = lambda k: np.array([float(train_set._arrays[eid][k][i]) for eid, i in train_set._index])
+            weights = weights * red_approach_weights(col("red"), col("speed"), col("red_dist"), cfg.boost_red_approach)
         sampler = WeightedRandomSampler(weights.tolist(), num_samples=len(cmds), generator=gen)
         train_loader = DataLoader(train_set, batch_size=cfg.batch_size, sampler=sampler, num_workers=cfg.num_workers)
     else:
@@ -223,6 +236,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--split-stops", action="store_true", help="perception by cause: red light, stop sign, yield (needs --percept-from-image)")
     p.add_argument("--balance-stops", action="store_true", help="balance (standing/moving, stop needed) cells; needs --split-stops data")
     p.add_argument("--light-camera", action="store_true", help="feed the traffic-light camera images to the perception head")
+    p.add_argument("--boost-red-approach", type=float, default=1.0, help="draw frames driving up to a red light (< 30 m) this many times more often; needs --split-stops data")
     p.add_argument("--balance-commands", action="store_true")
     p.add_argument("--amp", action="store_true", help="mixed precision (CUDA only)")
     p.add_argument("--cache-dir", help="decoded-image cache folder (built on first use; pixels identical to the PNGs)")
@@ -234,7 +248,8 @@ def main(argv: list[str] | None = None) -> None:
     train_ids, val_ids = folds[a.fold]
     split = [1.0, 0.5, 0.5, 0.5, 1.0, 0.05, 0.05, 1.0, 0.05, 0.05, 0.1]
     weights = a.loss_weights or ((split if a.split_stops else [1.0, 0.5, 0.5, 0.5, 1.0, 0.05, 0.05, 0.1]) if a.perceive else [1.0, 0.5, 0.5, 0.5] if a.predict_speed else [1.0, 0.5, 0.5])
-    result = train(TrainConfig(a.data_root, train_ids, val_ids, a.out_dir, a.epochs, a.batch_size, a.lr, a.device, a.seed, a.num_workers, loss_weights=weights, backbone=a.backbone, balance_commands=a.balance_commands, amp=a.amp, cache_dir=a.cache_dir, resume=a.resume, predict_speed=a.predict_speed, perceive=a.perceive, percept_from_image=a.percept_from_image, balance_curves=a.balance_curves, split_stops=a.split_stops, balance_stops=a.balance_stops, light_camera=a.light_camera))
+    result = train(TrainConfig(a.data_root, train_ids, val_ids, a.out_dir, a.epochs, a.batch_size, a.lr, a.device, a.seed, a.num_workers, loss_weights=weights, backbone=a.backbone, balance_commands=a.balance_commands, amp=a.amp, cache_dir=a.cache_dir, resume=a.resume, predict_speed=a.predict_speed, perceive=a.perceive, percept_from_image=a.percept_from_image, balance_curves=a.balance_curves, split_stops=a.split_stops, balance_stops=a.balance_stops, light_camera=a.light_camera,
+                                 boost_red_approach=a.boost_red_approach))
     print(json.dumps(result["history"][-1]))
 
 
