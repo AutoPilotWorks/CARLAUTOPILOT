@@ -2,7 +2,7 @@ import math
 
 import pytest
 
-from carlautopilot.carla_env.route import WindowedRoute, carla_to_xy, carla_yaw_to_rad, commands_from_options, dedupe_points
+from carlautopilot.carla_env.route import WindowedRoute, carla_to_xy, carla_yaw_to_rad, commands_from_options, dedupe_points, junction_turn_options
 from carlautopilot.core import Command
 
 
@@ -58,3 +58,18 @@ def _obs(points):
     from carlautopilot.core import Observation
 
     return Observation(t=0.0, speed_mps=7.0, command=Command.FOLLOW, extras={"lookahead_points": points})
+
+
+def test_junction_turn_options_relabels_a_planner_follow_turn():
+    # straight east 20 m, a junction curving 90 deg left (north), straight north 20 m; planner said LANEFOLLOW (4)
+    pts = [(x, 0.0) for x in range(0, 21, 2)] + [(20 + 10 * math.sin(a), 10 - 10 * math.cos(a)) for a in [k * math.pi / 16 for k in range(1, 8)]]
+    pts += [(30.0, y) for y in range(10, 31, 2)]
+    junc = [10 < k < 11 + 7 for k in range(len(pts))]
+    opts = junction_turn_options(pts, [4] * len(pts), junc)
+    assert {opts[k] for k in range(len(pts)) if junc[k]} == {1} and {opts[k] for k in range(len(pts)) if not junc[k]} == {4}
+    assert junction_turn_options([(p[0], -p[1]) for p in pts], [4] * len(pts), junc)[12] == 2  # mirrored: right
+    assert junction_turn_options(pts, [3] * len(pts), junc)[12] == 1  # STRAIGHT on a 90 deg turn is fixed too
+    flat = [(float(x), 0.0) for x in range(0, 60, 2)]
+    assert junction_turn_options(flat, [3] * len(flat), [10 < k < 18 for k in range(len(flat))]) == [3] * len(flat)  # straight: kept
+    assert junction_turn_options(pts, [4] * len(pts), [k < 15 for k in range(len(pts))])[0] == 4  # run touches the start: kept
+    assert junction_turn_options(pts[9:], [4] * (len(pts) - 9), junc[9:])[3] == 1  # only 2 m of road before the junction

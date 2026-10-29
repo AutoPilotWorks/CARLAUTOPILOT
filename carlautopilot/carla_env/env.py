@@ -11,7 +11,7 @@ from pathlib import Path
 import carla
 import numpy as np
 
-from carlautopilot.carla_env.route import LANE_CHANGE_OPTIONS, WindowedRoute, carla_to_xy, carla_yaw_to_rad, commands_from_options, dedupe_points
+from carlautopilot.carla_env.route import LANE_CHANGE_OPTIONS, WindowedRoute, carla_to_xy, carla_yaw_to_rad, commands_from_options, dedupe_points, junction_turn_options
 from carlautopilot.core import Action, Command, Event, EventKind, GroundTruth, LeadInfo, Observation, StepResult
 from carlautopilot.scenario import RouteCommand, ScenarioSpec, Waypoint
 from carlautopilot.sim.fake_env import (
@@ -187,7 +187,7 @@ class CarlaEnv:
             pts = [carla_to_xy(wp.transform.location.x, wp.transform.location.y) for wp, _ in trace]
             keep = dedupe_points(pts)
             pts = [pts[i] for i in keep]
-            opts = [int(trace[i][1]) for i in keep]
+            opts = junction_turn_options(pts, [int(trace[i][1]) for i in keep], [bool(trace[i][0].is_junction) for i in keep])
             if len(pts) < 2:
                 continue
             s = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(np.array(pts), axis=0).T))])

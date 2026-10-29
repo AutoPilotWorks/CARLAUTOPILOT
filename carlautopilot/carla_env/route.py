@@ -44,6 +44,40 @@ def commands_from_options(s: Sequence[float], options: Sequence[int], lead_m: fl
     return tuple(out)
 
 
+JUNCTION_TURN_DEG = 45.0
+JUNCTION_REACH_M = 6.0
+
+
+def junction_turn_options(points: Sequence[tuple[float, float]], options: Sequence[int], in_junction: Sequence[bool],
+                          turn_deg: float = JUNCTION_TURN_DEG, reach_m: float = JUNCTION_REACH_M) -> list[int]:
+    """GlobalRoutePlanner sometimes labels a real junction turn LANEFOLLOW (or STRAIGHT / the wrong side): 16 of 896
+    junctions in the 2026-10-29 count, 3 of them off-road endings in Town03. Where the route's heading from reach_m
+    before a junction run to reach_m after it turns by >= turn_deg, the run becomes LEFT/RIGHT by that turn; smaller
+    turns keep the planner's option, and a run touching either route end has no heading to measure and is kept too."""
+    pts = np.asarray(points, dtype=float)
+    s = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(pts, axis=0).T))])
+    out = [int(o) for o in options]
+    n, i = len(out), 0
+    while i < n:
+        if not in_junction[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and in_junction[j + 1]:
+            j += 1
+        # up to reach_m outside the run (fewer when the route starts/ends closer: 200_005 starts 6 m before its turn)
+        a, b = max(np.searchsorted(s, s[i] - reach_m, "right") - 1, 0), min(np.searchsorted(s, s[j] + reach_m), n - 1)
+        if i > 0 and j < n - 1:
+            h_in = math.atan2(*(pts[i] - pts[a])[::-1])
+            h_out = math.atan2(*(pts[b] - pts[j])[::-1])
+            turn = math.degrees((h_out - h_in + math.pi) % (2 * math.pi) - math.pi)  # + is left (y points left)
+            want = 1 if turn > 0 else 2
+            if abs(turn) >= turn_deg and want not in out[i : j + 1]:  # planner already right: keep its exact extent
+                out[i : j + 1] = [want] * (j - i + 1)
+        i = j + 1
+    return out
+
+
 class WindowedRoute:
     """Polyline route whose projection is restricted to an s-window, so a route that passes near itself does not jump."""
 

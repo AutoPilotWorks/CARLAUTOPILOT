@@ -42,6 +42,7 @@ class TrainConfig:
     balance_stops: bool = False
     light_camera: bool = False
     boost_red_approach: float = 1.0
+    boost_yield: float = 1.0
     loss_weights: list[float] = field(default_factory=lambda: [1.0, 0.5, 0.5])
 
 
@@ -118,6 +119,17 @@ def red_approach_weights(red: np.ndarray, speed: np.ndarray, red_dist: np.ndarra
     return np.where((red > 0.5) & (speed >= STOP_SLOW_MPS) & (red_dist < RED_APPROACH_M), boost, 1.0)
 
 
+EXCLUDE_FILE = "exclude_rows.json"
+
+
+def excluded_rows(root: str | Path, index: list[tuple[str, int]]) -> np.ndarray:
+    """True for rows listed in <root>/exclude_rows.json ({episode: [[first, last], ...]}): rows whose route command was
+    wrong at a junction (planner said FOLLOW where the route turns), so the expert's turn contradicts the command."""
+    path = Path(root) / EXCLUDE_FILE
+    spans = json.loads(path.read_text()) if path.is_file() else {}
+    return np.array([any(a <= i <= b for a, b in spans.get(eid, ())) for eid, i in index], dtype=bool)
+
+
 def _run_epoch(model, loader, device, w, optimizer=None, scaler=None) -> float:
     train = optimizer is not None
     model.train(train)
@@ -163,20 +175,24 @@ def train(cfg: TrainConfig) -> dict:
     train_set = EpisodeDataset(cfg.data_root, cfg.train_ids, cfg.cache_dir, cfg.predict_speed, cfg.perceive, cfg.split_stops, cfg.light_camera)
     val_set = EpisodeDataset(cfg.data_root, cfg.val_ids, cfg.cache_dir, cfg.predict_speed, cfg.perceive, cfg.split_stops, cfg.light_camera)
     gen = torch.Generator().manual_seed(cfg.seed)
-    if cfg.balance_commands or cfg.balance_curves or cfg.balance_stops or cfg.boost_red_approach != 1.0:
+    excluded = excluded_rows(cfg.data_root, train_set._index)
+    if cfg.balance_commands or cfg.balance_curves or cfg.balance_stops or cfg.boost_red_approach != 1.0 or cfg.boost_yield != 1.0 or excluded.any():
         cmds = np.array([int(train_set._arrays[eid]["command"][i]) for eid, i in train_set._index])
+        col = lambda k: np.array([float(train_set._arrays[eid][k][i]) for eid, i in train_set._index])
         if cfg.balance_curves:
             ts = np.array([float(train_set._arrays[eid]["target_speed"][i]) for eid, i in train_set._index])
             weights = curve_weights(cmds, ts)
         else:
             weights = command_weights(cmds)
         if cfg.balance_stops:
-            col = lambda k: np.array([float(train_set._arrays[eid][k][i]) for eid, i in train_set._index])
             needed = ((col("red") > 0.5) | (col("yield") > 0.5) | (col("sign_dist") < STOP_SIGN_ZONE_M)).astype(int)
             weights = weights * stop_weights(col("speed"), needed)
         if cfg.boost_red_approach != 1.0:
-            col = lambda k: np.array([float(train_set._arrays[eid][k][i]) for eid, i in train_set._index])
             weights = weights * red_approach_weights(col("red"), col("speed"), col("red_dist"), cfg.boost_red_approach)
+        if cfg.boost_yield != 1.0:
+            # yield rows are ~1% and balance_stops buckets them with red/stop sign, so v1.11 never predicted yield
+            weights = weights * np.where(col("yield") > 0.5, cfg.boost_yield, 1.0)
+        weights = weights * ~excluded
         sampler = WeightedRandomSampler(weights.tolist(), num_samples=len(cmds), generator=gen)
         train_loader = DataLoader(train_set, batch_size=cfg.batch_size, sampler=sampler, num_workers=cfg.num_workers)
     else:
@@ -237,6 +253,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--balance-stops", action="store_true", help="balance (standing/moving, stop needed) cells; needs --split-stops data")
     p.add_argument("--light-camera", action="store_true", help="feed the traffic-light camera images to the perception head")
     p.add_argument("--boost-red-approach", type=float, default=1.0, help="draw frames driving up to a red light (< 30 m) this many times more often; needs --split-stops data")
+    p.add_argument("--boost-yield", type=float, default=1.0, help="draw yield frames this many times more often; needs --split-stops data")
     p.add_argument("--balance-commands", action="store_true")
     p.add_argument("--amp", action="store_true", help="mixed precision (CUDA only)")
     p.add_argument("--cache-dir", help="decoded-image cache folder (built on first use; pixels identical to the PNGs)")
@@ -249,7 +266,7 @@ def main(argv: list[str] | None = None) -> None:
     split = [1.0, 0.5, 0.5, 0.5, 1.0, 0.05, 0.05, 1.0, 0.05, 0.05, 0.1]
     weights = a.loss_weights or ((split if a.split_stops else [1.0, 0.5, 0.5, 0.5, 1.0, 0.05, 0.05, 0.1]) if a.perceive else [1.0, 0.5, 0.5, 0.5] if a.predict_speed else [1.0, 0.5, 0.5])
     result = train(TrainConfig(a.data_root, train_ids, val_ids, a.out_dir, a.epochs, a.batch_size, a.lr, a.device, a.seed, a.num_workers, loss_weights=weights, backbone=a.backbone, balance_commands=a.balance_commands, amp=a.amp, cache_dir=a.cache_dir, resume=a.resume, predict_speed=a.predict_speed, perceive=a.perceive, percept_from_image=a.percept_from_image, balance_curves=a.balance_curves, split_stops=a.split_stops, balance_stops=a.balance_stops, light_camera=a.light_camera,
-                                 boost_red_approach=a.boost_red_approach))
+                                 boost_red_approach=a.boost_red_approach, boost_yield=a.boost_yield))
     print(json.dumps(result["history"][-1]))
 
 

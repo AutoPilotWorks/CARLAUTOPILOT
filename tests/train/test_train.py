@@ -171,20 +171,24 @@ def test_split_stops_trains_eleven_outputs_with_stop_balancing(tmp_path):
     import numpy as np
 
     from carlautopilot.policies.model_policy import ModelPolicy
-    from carlautopilot.train.train_steering import red_approach_weights, stop_weights
+    from carlautopilot.train.train_steering import EXCLUDE_FILE, excluded_rows, red_approach_weights, stop_weights
 
     ids = make_episodes(tmp_path / "data", n_episodes=4, steps=6, target_speed=True, perception=True, split_stops=True)
     with pytest.raises(ValueError):
         train(TrainConfig(str(tmp_path / "data"), ids[:3], ids[3:], str(tmp_path / "bad"), epochs=1, predict_speed=True, perceive=True,
                           percept_from_image=True, split_stops=True, loss_weights=[1.0] * 8))
     train(TrainConfig(str(tmp_path / "data"), ids[:3], ids[3:], str(tmp_path / "out"), epochs=1, predict_speed=True, perceive=True,
-                      percept_from_image=True, split_stops=True, balance_stops=True, boost_red_approach=3.0, loss_weights=[1.0] * 11))
+                      percept_from_image=True, split_stops=True, balance_stops=True, boost_red_approach=3.0, boost_yield=5.0, loss_weights=[1.0] * 11))
     pol = ModelPolicy.from_checkpoint(tmp_path / "out" / "checkpoint.pt")
     assert pol.model.split_stops and pol.model.n_out == 11
     w = stop_weights(np.array([0.0, 0.0, 0.0, 5.0]), np.array([1, 1, 0, 0]))
     assert np.allclose(w, [0.5, 0.5, 1.0, 1.0])
     w = red_approach_weights(np.array([1, 1, 1, 0]), np.array([5.0, 0.0, 5.0, 5.0]), np.array([20.0, 20.0, 35.0, 20.0]), 3.0)
     assert np.allclose(w, [3.0, 1.0, 1.0, 1.0])  # only moving, red, within 30 m
+    (tmp_path / "data" / EXCLUDE_FILE).write_text('{"%s": [[1, 2]]}' % ids[0])
+    assert excluded_rows(tmp_path / "data", [(ids[0], 0), (ids[0], 1), (ids[0], 2), (ids[0], 3), (ids[1], 1)]).tolist() == [False, True, True, False, False]
+    train(TrainConfig(str(tmp_path / "data"), ids[:3], ids[3:], str(tmp_path / "out2"), epochs=1, predict_speed=True, perceive=True,
+                      percept_from_image=True, split_stops=True, loss_weights=[1.0] * 11))  # exclusion alone turns the sampler on
 
 
 def test_light_camera_model_trains_and_needs_the_light_image(tmp_path):
