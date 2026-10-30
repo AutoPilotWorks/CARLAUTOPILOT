@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -43,6 +44,7 @@ class TrainConfig:
     light_camera: bool = False
     boost_red_approach: float = 1.0
     boost_yield: float = 1.0
+    cosine: bool = False
     loss_weights: list[float] = field(default_factory=lambda: [1.0, 0.5, 0.5])
 
 
@@ -117,6 +119,11 @@ def red_approach_weights(red: np.ndarray, speed: np.ndarray, red_dist: np.ndarra
     """boost for frames driving up to a red light within RED_APPROACH_M: where v1.10c misjudged the stop line by +5 m in an
     unseen town and braked too late (Town02, 2026-10-28)."""
     return np.where((red > 0.5) & (speed >= STOP_SLOW_MPS) & (red_dist < RED_APPROACH_M), boost, 1.0)
+
+
+def cosine_lr(lr: float, epoch: int, epochs: int) -> float:
+    """Per-epoch cosine decay from lr (epoch 1) to near 0 (last epoch); set from the epoch number, so resume needs no state."""
+    return lr * 0.5 * (1.0 + math.cos(math.pi * (epoch - 1) / epochs))
 
 
 EXCLUDE_FILE = "exclude_rows.json"
@@ -216,6 +223,10 @@ def train(cfg: TrainConfig) -> dict:
         history = state["history"]
         print(json.dumps({"resumed_after_epoch": len(history)}), flush=True)
     for epoch in range(len(history) + 1, cfg.epochs + 1):
+        if cfg.cosine:
+            # constant lr left v1.11/v1.12 still swinging at the last epoch (Town02 corner steer +0.17 at epoch 7, +0.05 at 8)
+            for g in optimizer.param_groups:
+                g["lr"] = cosine_lr(cfg.lr, epoch, cfg.epochs)
         tr = _run_epoch(model, train_loader, device, w, optimizer, scaler)
         va = _run_epoch(model, val_loader, device, w, scaler=scaler)
         history.append({"epoch": epoch, "train_loss": tr, "val_loss": va})
@@ -254,6 +265,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--light-camera", action="store_true", help="feed the traffic-light camera images to the perception head")
     p.add_argument("--boost-red-approach", type=float, default=1.0, help="draw frames driving up to a red light (< 30 m) this many times more often; needs --split-stops data")
     p.add_argument("--boost-yield", type=float, default=1.0, help="draw yield frames this many times more often; needs --split-stops data")
+    p.add_argument("--cosine", action="store_true", help="cosine learning-rate decay over the epochs (per epoch)")
     p.add_argument("--balance-commands", action="store_true")
     p.add_argument("--amp", action="store_true", help="mixed precision (CUDA only)")
     p.add_argument("--cache-dir", help="decoded-image cache folder (built on first use; pixels identical to the PNGs)")
@@ -266,7 +278,7 @@ def main(argv: list[str] | None = None) -> None:
     split = [1.0, 0.5, 0.5, 0.5, 1.0, 0.05, 0.05, 1.0, 0.05, 0.05, 0.1]
     weights = a.loss_weights or ((split if a.split_stops else [1.0, 0.5, 0.5, 0.5, 1.0, 0.05, 0.05, 0.1]) if a.perceive else [1.0, 0.5, 0.5, 0.5] if a.predict_speed else [1.0, 0.5, 0.5])
     result = train(TrainConfig(a.data_root, train_ids, val_ids, a.out_dir, a.epochs, a.batch_size, a.lr, a.device, a.seed, a.num_workers, loss_weights=weights, backbone=a.backbone, balance_commands=a.balance_commands, amp=a.amp, cache_dir=a.cache_dir, resume=a.resume, predict_speed=a.predict_speed, perceive=a.perceive, percept_from_image=a.percept_from_image, balance_curves=a.balance_curves, split_stops=a.split_stops, balance_stops=a.balance_stops, light_camera=a.light_camera,
-                                 boost_red_approach=a.boost_red_approach, boost_yield=a.boost_yield))
+                                 boost_red_approach=a.boost_red_approach, boost_yield=a.boost_yield, cosine=a.cosine))
     print(json.dumps(result["history"][-1]))
 
 

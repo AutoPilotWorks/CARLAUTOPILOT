@@ -13,6 +13,9 @@ from carlautopilot.models.route_steering import PERCEPT_RANGE_M
 from carlautopilot.scenario import ScenarioSpec
 
 NOISE_AR = 0.9
+# DAgger: the expert takes the wheel past TAKEOVER_M off the route centre and hands it back under RETURN_M, so the
+# model's own drift is recorded with expert labels without the episode ending off-road (OFF_ROAD_LATERAL_M = 2 m)
+TAKEOVER_M, RETURN_M = 1.5, 0.3
 
 
 def perception_labels(obs: Observation) -> tuple[float, float, float, float] | None:
@@ -65,8 +68,13 @@ def collect_episode(
     png_compress: int = 6,
     stream_images: Callable[[Observation], list[list[np.ndarray]]] | None = None,
     stream_roots: Sequence[str | Path] = (),
+    driver: Policy | None = None,
 ) -> dict:
     """Drive with the expert and store (image, speed, command, expert action) per step.
+
+    With a driver (DAgger), the driver steers and the expert keeps the pedals and the labels: the data then covers
+    the states the driver itself gets into (e.g. a model under-steering into a corner), not only the expert's.
+    The expert takes over between TAKEOVER_M and RETURN_M of lateral error (needs privileged observations).
 
     extra_samples(obs, action) may add (image, label) pairs for the same step, e.g. side cameras.
     stream_images(obs) returns, for each extra camera rig, the images matching this step's rows (centre then the
@@ -80,6 +88,9 @@ def collect_episode(
     if obs.image is None:
         raise ValueError("the environment must provide images (render_images=True)")
     expert.reset()
+    if driver is not None:
+        driver.reset()
+    expert_on, takeovers, driver_steps = False, 0, 0
     rng = np.random.default_rng(noise_seed)
     limit = max_steps if max_steps is not None else int(scenario.max_time_s / env.dt) + 10
     noise = 0.0
@@ -113,8 +124,16 @@ def collect_episode(
                     if len(imgs) != len(images) - n_before:
                         raise ValueError("stream images do not match the rows of this step")
                     streams[k].extend(imgs)
+        steer = action.steer
+        if driver is not None:
+            lat = abs(obs.extras["lateral_error_m"])
+            takeovers += lat > TAKEOVER_M and not expert_on
+            expert_on = lat > TAKEOVER_M or (expert_on and lat > RETURN_M)
+            driven = driver.act(obs)  # every step, so the driver's own timers (stop signs) stay current
+            if not expert_on:
+                steer, driver_steps = driven.steer, driver_steps + 1
         noise = NOISE_AR * noise + math.sqrt(1.0 - NOISE_AR**2) * float(rng.normal(0.0, steer_noise_std)) if steer_noise_std > 0 else 0.0
-        res = env.step(Action(action.steer + noise, action.throttle, action.brake).clipped())
+        res = env.step(Action(steer + noise, action.throttle, action.brake).clipped())
         obs = res.obs
         if res.done:
             termination = res.termination
@@ -155,7 +174,10 @@ def collect_episode(
     for k, extra_root in enumerate(stream_roots):
         write_episode(extra_root, episode_id, meta, arrays, np.stack(streams[k]), png_compress, light_stack)
     t_end = time.perf_counter()
-    return {"episode_id": episode_id, "steps": len(rows), "termination": termination, "sim_s": round(t_sim - t_start, 1), "write_s": round(t_end - t_sim, 1)}
+    info = {"episode_id": episode_id, "steps": len(rows), "termination": termination, "sim_s": round(t_sim - t_start, 1), "write_s": round(t_end - t_sim, 1)}
+    if driver is not None:
+        info.update(takeovers=takeovers, driver_share=round(driver_steps / (step + 1), 3))
+    return info
 
 
 def collect_dataset(

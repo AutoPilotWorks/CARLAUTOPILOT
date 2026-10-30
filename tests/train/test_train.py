@@ -98,6 +98,15 @@ def test_balanced_and_amp_training_runs(tmp_path, device):
     assert res["history"][0]["train_loss"] > 0
 
 
+def test_cosine_lr_decays_to_near_zero_and_trains(tmp_path):
+    from carlautopilot.train.train_steering import cosine_lr
+
+    lrs = [cosine_lr(1.0, e, 8) for e in range(1, 9)]
+    assert lrs[0] == 1.0 and all(a > b for a, b in zip(lrs, lrs[1:])) and lrs[-1] < 0.05
+    ids = make_episodes(tmp_path / "data", n_episodes=4, steps=4)
+    assert train(TrainConfig(str(tmp_path / "data"), ids[:3], ids[3:], str(tmp_path / "out"), epochs=2, cosine=True))["history"]
+
+
 def test_resume_continues_after_the_last_saved_epoch(tmp_path):
     ids = make_episodes(tmp_path / "data", n_episodes=4, steps=4)
     first = train(TrainConfig(str(tmp_path / "data"), ids[:3], ids[3:], str(tmp_path / "out"), epochs=1))

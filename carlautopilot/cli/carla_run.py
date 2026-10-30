@@ -78,6 +78,11 @@ def collect(a: argparse.Namespace, env: CarlaEnv) -> None:
     roots = rig_roots(a.data_root, a.rigs)
     root = roots[0]
     (root / "scenarios").mkdir(parents=True, exist_ok=True)
+    driver = None
+    if a.dagger:
+        from carlautopilot.policies.model_policy import ModelPolicy
+
+        driver = ModelPolicy.from_checkpoint(a.dagger, acc=ACC, device="cuda")  # only its steering is used
     for sc in make_scenarios(env, a):
         eid = sc.name
         if (root / eid).exists():
@@ -87,10 +92,12 @@ def collect(a: argparse.Namespace, env: CarlaEnv) -> None:
         info = collect_episode(
             env, expert(a.speed, a.vehicle, a.start_delay, zlib.crc32(eid.encode())), sc, root, eid, steer_noise_std=a.noise, noise_seed=zlib.crc32(eid.encode()), stride=a.stride,
             extra_samples=view_labeler(env.extra_views, a.speed, a.vehicle) if env.extra_views else None, png_compress=a.png_compress,
-            stream_images=(lambda obs: obs.extras["rig_images"]) if len(roots) > 1 else None, stream_roots=roots[1:],
+            stream_images=(lambda obs: obs.extras["rig_images"]) if len(roots) > 1 else None, stream_roots=roots[1:], driver=driver,
         )
         info["wall_s"] = round(time.time() - t0, 1)
         info["weather"] = sc.meta["weather"]
+        if a.dagger:
+            info["driver"] = a.dagger
         with open(root / "collect_log.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(info) + "\n")
         print(json.dumps(info), flush=True)
@@ -138,6 +145,7 @@ def main(argv: list[str] | None = None) -> None:
     c.add_argument("--start-delay", type=float, default=0.0, help="expert waits a random 0..this s after a stop reason clears (reaction time)")
     c.add_argument("--png-compress", type=int, default=6, help="PNG zlib level 0-9 (lossless); lower is faster, files larger")
     c.add_argument("--rigs", default="", help="camera rigs as fov:turn_deg, comma separated, e.g. 120:0,90:25 (one data root per rig)")
+    c.add_argument("--dagger", help="checkpoint that steers while the expert labels (DAgger); the camera must match its training rig")
     c.add_argument("--views", default="", help="extra cameras as left_offset_m:left_yaw_deg, comma separated, e.g. 1:0,-1:0,0:10,0:-10")
     e = sub.choices["eval"]
     e.add_argument("--out-dir", required=True)

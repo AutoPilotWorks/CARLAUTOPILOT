@@ -152,6 +152,23 @@ def test_collect_stores_expert_target_speed_only_when_available(tmp_path):
     assert "target_speed" not in read_episode(tmp_path, "c")[1]
 
 
+def test_dagger_driver_steers_expert_labels_and_takes_over(tmp_path):
+    from carlautopilot.core import Action
+    from carlautopilot.data.collect import collect_episode
+    from carlautopilot.data.episode_store import read_episode
+    from carlautopilot.policies import ConstantPolicy, PathFollowPolicy
+    from carlautopilot.scenarios_lib import straight
+    from carlautopilot.sim import FakeEnv
+
+    # a driver that always steers hard left drifts off; the expert must take over and the labels stay the expert's
+    info = collect_episode(FakeEnv(render_images=True, privileged_obs=True), PathFollowPolicy(), straight(), tmp_path, "d",
+                           max_steps=400, driver=ConstantPolicy(Action(0.5, 0.0, 0.0)))
+    steer = read_episode(tmp_path, "d")[1]["steer"]
+    assert info["takeovers"] >= 1 and 0.0 < info["driver_share"] < 1.0
+    assert info["termination"] != "off_route"
+    assert (steer < 0.5).all() and (steer < 0).any()  # expert steers back right, never copies the driver
+
+
 def test_image_cache_matches_png_and_png_level_is_lossless(tmp_path):
     import numpy as np
 
