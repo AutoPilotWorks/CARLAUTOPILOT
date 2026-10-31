@@ -248,7 +248,50 @@ def test_light_camera_images_round_trip_through_store_cache_and_dataset(tmp_path
     meta = {"scenario_name": "x", "seed": 0, "dt": 0.1, "image_height": 4, "image_width": 4}
     img = np.zeros((2, 4, 4, 3), np.uint8)
     with pytest.raises(ValueError):
-        write_episode(tmp_path / "e", "bad", meta, a, img, light_images=img[:1])
+        write_episode(tmp_path / "e", "bad", meta, a, img, step_images={"light": img[:1]})
     make_episodes(tmp_path / "d2", n_episodes=1, steps=2)
     with pytest.raises(ValueError):
         EpisodeDataset(tmp_path / "d2", ["ep000"], light=True)
+    with pytest.raises(ValueError):  # surround cameras without the light images
+        write_episode(tmp_path / "e", "no_light", meta, a, img, step_images={"left": img})
+    with pytest.raises(ValueError):  # a surround camera short of one image per step
+        write_episode(tmp_path / "e", "short_left", meta, a, img, step_images={"light": img, "left": img[:1]})
+
+
+def test_multicam_collect_stores_surround_per_step(tmp_path):
+    import numpy as np
+    import pytest
+
+    from carlautopilot.data.collect import collect_episode
+    from carlautopilot.data.episode_store import load_image, read_episode, validate_episode
+    from carlautopilot.policies import PathFollowPolicy
+    from carlautopilot.scenarios_lib import straight
+    from carlautopilot.sim import FakeEnv
+
+    class MultiCam(FakeEnv):
+        """What CarlaEnv(multicam=True) adds to every observation; pixel value = env step + camera offset."""
+        n = 0
+
+        def _cams(self, obs):
+            img = lambda v: np.full((8, 16, 3), v % 256, np.uint8)
+            obs.extras.update(light_image=img(self.n), surround_images={"left": img(self.n + 1), "right": img(self.n + 2), "rear": img(self.n + 3)})
+            self.n += 1
+            return obs
+
+        def reset(self, *a, **k):
+            return self._cams(super().reset(*a, **k))
+
+        def step(self, *a, **k):
+            res = super().step(*a, **k)
+            self._cams(res.obs)
+            return res
+
+    collect_episode(MultiCam(render_images=True, privileged_obs=True), PathFollowPolicy(), straight(), tmp_path, "m", max_steps=10, stride=2)
+    _, arrays = read_episode(tmp_path, "m")
+    assert list(arrays["light_idx"]) == [0, 1, 2, 3, 4]
+    for j in range(5):  # stride 2: stored step j is env step 2j, and every camera keeps its own image of that step
+        for folder, off in (("light", 0), ("left", 1), ("right", 2), ("rear", 3)):
+            assert load_image(tmp_path, "m", j, folder)[0, 0, 0] == 2 * j + off
+    (tmp_path / "m" / "rear" / "000004.png").unlink()
+    with pytest.raises(ValueError, match="rear camera files"):
+        validate_episode(tmp_path, "m")

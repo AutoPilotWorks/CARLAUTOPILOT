@@ -73,3 +73,18 @@ def test_junction_turn_options_relabels_a_planner_follow_turn():
     assert junction_turn_options(flat, [3] * len(flat), [10 < k < 18 for k in range(len(flat))]) == [3] * len(flat)  # straight: kept
     assert junction_turn_options(pts, [4] * len(pts), [k < 15 for k in range(len(pts))])[0] == 4  # run touches the start: kept
     assert junction_turn_options(pts[9:], [4] * (len(pts) - 9), junc[9:])[3] == 1  # only 2 m of road before the junction
+
+
+def test_multicam_downscale_and_light_crop():
+    import numpy as np
+
+    env = pytest.importorskip("carlautopilot.carla_env.env")
+    img = np.random.default_rng(0).integers(0, 256, (640, 1280, 3), dtype=np.uint8)
+    small = env.box_downscale(img, 4)
+    assert small.shape == (160, 320, 3) and small.dtype == np.uint8
+    assert small[3, 5, 1] == round(img[12:16, 20:24, 1].mean())
+    crop = env.light_crop(img, 120.0)
+    # f = 369.5 px: 50 deg wide = 2 x 172 px; 18 deg up to 8 deg down = rows 200..372 (horizon at row 320)
+    assert crop.shape == (172, 344, 3) and np.array_equal(crop[0, 0], img[200, 468])
+    with pytest.raises(ValueError):
+        env.CarlaEnv.__init__(object.__new__(env.CarlaEnv), vehicle="truck", multicam=True)

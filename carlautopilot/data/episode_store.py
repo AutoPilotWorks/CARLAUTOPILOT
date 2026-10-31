@@ -11,8 +11,10 @@ PERCEPTION_KEYS = ("light_red", "light_dist", "lead_dist", "lead_rel")
 # the merged "stop needed" above split by cause: red light (+ stop line), any stop sign ahead, yield (+ junction entry)
 STOP_KEYS = ("red", "red_dist", "sign_dist", "yield", "yield_dist")
 SPLIT_PERCEPTION_KEYS = STOP_KEYS + ("lead_dist", "lead_rel")
-# light_idx: row -> index into light/ (one traffic-light camera image per time step, shared by that step's view rows)
+# light_idx: row -> time-step index into the per-step camera folders (one image per time step, shared by that step's
+# view rows): light/ always, plus the sedan's surround cameras left/ right/ rear/ when it has them
 OPTIONAL_KEYS = ("target_speed",) + PERCEPTION_KEYS + STOP_KEYS + ("light_idx",)
+STEP_FOLDERS = ("light", "left", "right", "rear")
 META_KEYS = ("scenario_name", "seed", "dt", "image_height", "image_width")
 
 
@@ -21,8 +23,10 @@ def episode_dir(root: str | Path, episode_id: str) -> Path:
 
 
 def write_episode(root: str | Path, episode_id: str, meta: dict, arrays: dict[str, np.ndarray], images: np.ndarray, png_compress: int = 6,
-                  light_images: np.ndarray | None = None) -> Path:
-    """png_compress is the zlib level 0-9 (6 = Pillow default); PNG is lossless, so it only trades file size for speed."""
+                  step_images: dict[str, np.ndarray] | None = None) -> Path:
+    """png_compress is the zlib level 0-9 (6 = Pillow default); PNG is lossless, so it only trades file size for speed.
+    step_images: STEP_FOLDERS name -> (steps, H, W, 3), indexed by arrays['light_idx']; "light" is required with any."""
+    step_images = step_images or {}
     d = episode_dir(root, episode_id)
     if d.exists():
         raise FileExistsError(f"episode already exists: {d}")
@@ -40,17 +44,21 @@ def write_episode(root: str | Path, episode_id: str, meta: dict, arrays: dict[st
         raise ValueError("images must be uint8 with shape (N, H, W, 3)")
     if images.shape[1] != meta["image_height"] or images.shape[2] != meta["image_width"]:
         raise ValueError("image size does not match meta")
-    if (light_images is None) != ("light_idx" not in arrays) or (light_images is not None and int(arrays["light_idx"].max()) + 1 != len(light_images)):
-        raise ValueError("light_images and arrays['light_idx'] must come together and match")
+    if set(step_images) - set(STEP_FOLDERS):
+        raise ValueError(f"unknown step image folders {sorted(set(step_images) - set(STEP_FOLDERS))}")
+    if ("light" in step_images) != ("light_idx" in arrays) or (step_images and "light" not in step_images):
+        raise ValueError("step images need the light images and arrays['light_idx'], and those come together")
+    if any(int(arrays["light_idx"].max()) + 1 != len(v) for v in step_images.values()):
+        raise ValueError("every step image folder needs one image per light_idx step")
     (d / "images").mkdir(parents=True)
     (d / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     np.savez(d / "steps.npz", **{k: np.asarray(arrays[k]) for k in keys})
     for i, img in enumerate(images):
         Image.fromarray(img).save(d / "images" / f"{i:06d}.png", compress_level=png_compress)
-    if light_images is not None:
-        (d / "light").mkdir()
-        for i, img in enumerate(light_images):
-            Image.fromarray(img).save(d / "light" / f"{i:06d}.png", compress_level=png_compress)
+    for folder, stack in step_images.items():
+        (d / folder).mkdir()
+        for i, img in enumerate(stack):
+            Image.fromarray(img).save(d / folder / f"{i:06d}.png", compress_level=png_compress)
     return d
 
 
@@ -80,8 +88,10 @@ def validate_episode(root: str | Path, episode_id: str) -> int:
     with Image.open(d / "images" / expected[0]) as im:
         if im.size != (meta["image_width"], meta["image_height"]):
             raise ValueError(f"{episode_id}: image size {im.size} differs from meta")
-    if n_light and sorted(p.name for p in (d / "light").glob("*.png")) != [f"{i:06d}.png" for i in range(n_light)]:
-        raise ValueError(f"{episode_id}: light camera files do not match light_idx")
+    for folder in STEP_FOLDERS:
+        if (folder == "light" and n_light) or (d / folder).is_dir():
+            if sorted(p.name for p in (d / folder).glob("*.png")) != [f"{i:06d}.png" for i in range(n_light)]:
+                raise ValueError(f"{episode_id}: {folder} camera files do not match light_idx")
     return n
 
 

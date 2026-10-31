@@ -96,6 +96,7 @@ def collect_episode(
     noise = 0.0
     rows, images, target_speeds, percepts, stops, lights, light_idx = [], [], [], [], [], [], []
     streams: list[list[np.ndarray]] = []
+    surround: dict[str, list[np.ndarray]] = {}  # the sedan rig's left/right/rear cameras, one image per step like light
     termination = None
     for step in range(limit):
         action = expert.act(obs).clipped()
@@ -107,6 +108,8 @@ def collect_episode(
             stops.append(stop_labels(obs))
             if "light_image" in obs.extras:
                 lights.append(obs.extras["light_image"])
+                for name, img in obs.extras.get("surround_images", {}).items():
+                    surround.setdefault(name, []).append(img)
             light_idx.append(len(lights) - 1)
             n_before = len(images) - 1
             for img, lab in extra_samples(obs, action) if extra_samples else ():
@@ -157,10 +160,10 @@ def collect_episode(
     if all(v is not None for v in stops):
         for k, col in zip(STOP_KEYS, zip(*stops)):
             arrays[k] = np.array(col, dtype=np.float32)
-    light_stack = None
+    step_images = {}
     if lights:
         arrays["light_idx"] = np.array(light_idx, dtype=np.int64)
-        light_stack = np.stack(lights)
+        step_images = {"light": np.stack(lights)} | {k: np.stack(v) for k, v in surround.items()}
     stack = np.stack(images)
     meta = {
         "scenario_name": scenario.name,
@@ -170,9 +173,9 @@ def collect_episode(
         "image_width": int(stack.shape[2]),
     }
     t_sim = time.perf_counter()
-    write_episode(root, episode_id, meta, arrays, stack, png_compress, light_stack)
+    write_episode(root, episode_id, meta, arrays, stack, png_compress, step_images)
     for k, extra_root in enumerate(stream_roots):
-        write_episode(extra_root, episode_id, meta, arrays, np.stack(streams[k]), png_compress, light_stack)
+        write_episode(extra_root, episode_id, meta, arrays, np.stack(streams[k]), png_compress, step_images)
     t_end = time.perf_counter()
     info = {"episode_id": episode_id, "steps": len(rows), "termination": termination, "sim_s": round(t_sim - t_start, 1), "write_s": round(t_end - t_sim, 1)}
     if driver is not None:

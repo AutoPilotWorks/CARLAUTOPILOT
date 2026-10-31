@@ -40,6 +40,6 @@ def make_episodes(root, n_episodes=4, steps=20, h=32, w=64, seed=0, target_speed
             arrays["light_idx"] = (np.arange(steps) // 2).astype(np.int64)  # two view rows per time step
             light_images = rng.integers(0, 256, size=(int(arrays["light_idx"][-1]) + 1, 16, 32, 3), dtype=np.uint8)
         meta = {"scenario_name": "synthetic", "seed": seed, "dt": 0.1, "image_height": h, "image_width": w}
-        write_episode(root, eid, meta, arrays, images, light_images=light_images)
+        write_episode(root, eid, meta, arrays, images, step_images={"light": light_images} if light else None)
         ids.append(eid)
     return ids

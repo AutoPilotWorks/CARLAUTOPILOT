@@ -138,6 +138,7 @@ def main(argv: list[str] | None = None) -> None:
         q.add_argument("--tm-port", type=int, default=8000, help="Traffic Manager port; give each parallel CARLA server its own")
         q.add_argument("--vehicle", default="sedan", choices=sorted(VEHICLES))
         q.add_argument("--light-camera", default="", help="traffic-light camera fov:pitch_up_deg:HxW, e.g. 30:9:128x256 (never swung)")
+        q.add_argument("--multicam", action="store_true", help="sedan rig: front at 4x --image-size (driving image + light crop) and left/right/rear cameras; use with --rigs 120:0 / --fov 120")
     c = sub.choices["collect"]
     c.add_argument("--data-root", required=True)
     c.add_argument("--noise", type=float, default=0.05)
@@ -169,7 +170,7 @@ def main(argv: list[str] | None = None) -> None:
         fov, pitch, size = a.light_camera.split(":")
         lh, lw = (int(v) for v in size.lower().split("x"))
         light = (float(fov), float(pitch), lh, lw)
-    env = CarlaEnv(a.host, a.port, tm_port=a.tm_port, image_size=(h, w), junction_rules=a.junction_rules, light_camera=light, privileged_obs=a.mode == "collect" or a.checkpoint is None, extra_views=views, vehicle=a.vehicle, rigs=rigs)
+    env = CarlaEnv(a.host, a.port, tm_port=a.tm_port, image_size=(h, w), junction_rules=a.junction_rules, light_camera=light, privileged_obs=a.mode == "collect" or a.checkpoint is None, extra_views=views, vehicle=a.vehicle, rigs=rigs, multicam=a.multicam)
     try:
         collect(a, env) if a.mode == "collect" else evaluate(a, env)
     finally:

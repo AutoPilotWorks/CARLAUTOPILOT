@@ -46,6 +46,35 @@ VEHICLES = {
     "truck_cab": ("vehicle.carlamotors.european_hgv", 4.42, math.radians(70.0), CAB_EYE_X, CAB_EYE_Y, CAB_EYE_Z),
 }
 TURN_CAMERA_RATE_DEG_S = 25.0
+# sedan multi-camera rig (stage 1 probe 2026-10-31, D:\carlautopilot_data\rig_probe): the front camera renders at
+# MULTICAM_SCALE x the image size; the driving image is its box-downscale and the traffic-light image a native-res crop,
+# so one physical front camera replaces the separate light camera. At 120 deg / 1280 px a light head at 40 m is ~3.5x11 px
+# (the truck's 50 deg / 320 px light camera: 3.3x10). Surround cameras at the mirrors and above the rear plate, name ->
+# (x, y, z, yaw, pitch, fov) in the vehicle frame (CARLA, y right): 150 deg at the mirrors halves the ground blind area
+# within 2 m of the body vs 120 deg (8.1 vs 16.8 m2 at pitch -20/-25).
+MULTICAM_SCALE = 4
+LIGHT_CROP_DEG = (50.0, 18.0, 8.0)  # width, above and below the horizon: the truck light camera's view (50 deg, up 5)
+SURROUND_CAMERAS = {
+    "left": (0.6, -1.05, 1.1, -90.0, -20.0, 150.0),
+    "right": (0.6, 1.05, 1.1, 90.0, -20.0, 150.0),
+    "rear": (-2.3, 0.0, 1.05, 180.0, -15.0, 120.0),
+}
+
+
+def box_downscale(img: np.ndarray, k: int) -> np.ndarray:
+    """(H*k, W*k, 3) uint8 -> (H, W, 3): rounded mean of each k x k block (anti-aliased, deterministic)."""
+    h, w = img.shape[0] // k, img.shape[1] // k
+    s = img[: h * k, : w * k].reshape(h, k, w, k, 3).sum(axis=(1, 3), dtype=np.uint32)
+    return ((s + k * k // 2) // (k * k)).astype(np.uint8)
+
+
+def light_crop(img: np.ndarray, fov_deg: float, crop: tuple[float, float, float] = LIGHT_CROP_DEG) -> np.ndarray:
+    """Centre crop of a pinhole image: crop[0] deg wide, from crop[1] deg above the horizon to crop[2] deg below."""
+    h, w = img.shape[:2]
+    f = w / (2 * math.tan(math.radians(fov_deg) / 2))
+    half = round(f * math.tan(math.radians(crop[0] / 2)))
+    top, bottom = round(h / 2 - f * math.tan(math.radians(crop[1]))), round(h / 2 + f * math.tan(math.radians(crop[2])))
+    return np.ascontiguousarray(img[max(top, 0):bottom, w // 2 - half:w // 2 + half])
 ROUTE_END_MARGIN_M = 2.0
 BLOCKED_SECONDS = 90.0  # CARLA reds at 4-way junctions can exceed 30 s
 CORRIDOR_HALF_M = 1.8
@@ -102,6 +131,7 @@ class CarlaEnv:
         rigs: tuple[tuple[float, float], ...] = ((90.0, 0.0),),
         junction_rules: bool = False,
         light_camera: tuple[float, float, int, int] | None = None,
+        multicam: bool = False,
     ):
         """extra_views: additional cameras as (offset left m, yaw left deg); their images go to extras["view_images"].
 
@@ -117,7 +147,16 @@ class CarlaEnv:
         light_camera: (fov deg, pitch up deg, height, width) of a narrow, never-swung camera at the same eye point for
         traffic lights; its image goes to extras["light_image"] (also without privileged_obs). At 120 deg / 320 px a light
         head across a junction (~45 m) is ~1x3 px and the model could not read its colour.
+
+        multicam: the sedan rig (see SURROUND_CAMERAS): one fixed front camera rendered at MULTICAM_SCALE x image_size
+        gives obs.image (downscaled) and extras["light_image"] (light_crop), and extras["surround_images"] holds
+        {left, right, rear} at image_size. Needs the sedan, one rig without a turn camera, no extra views or light camera.
         """
+        if multicam and (vehicle != "sedan" or len(rigs) != 1 or rigs[0][1] or extra_views or light_camera):
+            raise ValueError("multicam needs the sedan, one rig without a turn camera, and no extra views or light camera")
+        self.multicam = multicam
+        self._surround_queues: dict[str, queue.Queue] = {}
+        self._surround_images: dict[str, np.ndarray] = {}
         self.light_camera = light_camera
         self._light_queue: queue.Queue | None = None
         self._light_image: np.ndarray | None = None
@@ -233,10 +272,11 @@ class CarlaEnv:
         self._cams = []
         self._rig_yaw = [0.0] * len(self.rigs)
         if self.render_images:
+            k = MULTICAM_SCALE if self.multicam else 1
             for r, (fov, _) in enumerate(self.rigs):
                 cam_bp = bpl.find("sensor.camera.rgb")
-                cam_bp.set_attribute("image_size_x", str(self.image_size[1]))
-                cam_bp.set_attribute("image_size_y", str(self.image_size[0]))
+                cam_bp.set_attribute("image_size_x", str(self.image_size[1] * k))
+                cam_bp.set_attribute("image_size_y", str(self.image_size[0] * k))
                 cam_bp.set_attribute("fov", str(fov))
                 for dy, dyaw in ((0.0, 0.0),) + self.extra_views:
                     cam = self.world.spawn_actor(cam_bp, self._mount(dy, dyaw), attach_to=self._ego)
@@ -245,6 +285,17 @@ class CarlaEnv:
                     self._queues.append(q)
                     self._cams.append((r, dy, dyaw, cam))
                     self._actors.append(cam)
+        self._surround_queues = {}
+        if self.render_images and self.multicam:
+            for name, (x, y, z, yaw, pitch, fov) in SURROUND_CAMERAS.items():
+                bp = bpl.find("sensor.camera.rgb")
+                bp.set_attribute("image_size_x", str(self.image_size[1]))
+                bp.set_attribute("image_size_y", str(self.image_size[0]))
+                bp.set_attribute("fov", str(fov))
+                cam = self.world.spawn_actor(bp, carla.Transform(carla.Location(x=x, y=y, z=z), carla.Rotation(pitch=pitch, yaw=yaw)), attach_to=self._ego)
+                self._surround_queues[name] = queue.Queue()
+                cam.listen(self._surround_queues[name].put)
+                self._actors.append(cam)
         self._light_queue = None
         if self.render_images and self.light_camera:
             fov, pitch, h, w = self.light_camera
@@ -450,6 +501,10 @@ class CarlaEnv:
         images = [self._read(q, frame) for q in self._queues]
         if self._light_queue is not None:
             self._light_image = self._read(self._light_queue, frame)
+        self._surround_images = {n: self._read(q, frame) for n, q in self._surround_queues.items()}
+        if images and self.multicam:
+            self._light_image = light_crop(images[0], self.rigs[0][0])
+            images[0] = box_downscale(images[0], MULTICAM_SCALE)
         if images:
             k = 1 + len(self.extra_views)
             groups = [images[i:i + k] for i in range(0, len(images), k)]
@@ -541,8 +596,10 @@ class CarlaEnv:
     def _observe(self) -> Observation:
         image = self._last_image if self.render_images else None
         extras = self._extras()
-        if self._light_queue is not None:
+        if self._light_queue is not None or (self.multicam and self.render_images):
             extras["light_image"] = self._light_image
+        if self._surround_images:
+            extras["surround_images"] = self._surround_images
         return Observation(t=self.t, speed_mps=self.v, command=self._command(), image=image, lead=self._lead_info(), extras=extras)
 
     def ground_truth(self) -> GroundTruth:
