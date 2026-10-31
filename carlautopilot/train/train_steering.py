@@ -140,11 +140,13 @@ def excluded_rows(root: str | Path, index: list[tuple[str, int]]) -> np.ndarray:
 def _run_epoch(model, loader, device, w, optimizer=None, scaler=None) -> float:
     train = optimizer is not None
     model.train(train)
-    total, count = 0.0, 0
+    # summed on the device in float64 (the same sum the old per-batch loss.item() made in Python): .item() every batch
+    # made the main process wait for the GPU each step
+    total, count = torch.zeros((), dtype=torch.float64, device=device), 0
     with torch.set_grad_enabled(train):
         for batch in loader:
-            image, speed, command, target = (batch[k].to(device) for k in ("image", "speed", "command", "target"))
-            light = batch["light"].to(device) if "light" in batch else None
+            image, speed, command, target = (batch[k].to(device, non_blocking=True) for k in ("image", "speed", "command", "target"))
+            light = batch["light"].to(device, non_blocking=True) if "light" in batch else None
             with torch.autocast(device.type, enabled=scaler is not None):
                 loss = _weighted_l1(model(image, speed, command, light).float(), target, w)
             if train:
@@ -156,9 +158,9 @@ def _run_epoch(model, loader, device, w, optimizer=None, scaler=None) -> float:
                     scaler.scale(loss).backward()
                     scaler.step(optimizer)
                     scaler.update()
-            total += float(loss.item()) * len(target)
+            total += loss.detach().double() * len(target)
             count += len(target)
-    return total / max(count, 1)
+    return float(total.item()) / max(count, 1)
 
 
 def train(cfg: TrainConfig) -> dict:
@@ -182,6 +184,9 @@ def train(cfg: TrainConfig) -> dict:
     train_set = EpisodeDataset(cfg.data_root, cfg.train_ids, cfg.cache_dir, cfg.predict_speed, cfg.perceive, cfg.split_stops, cfg.light_camera)
     val_set = EpisodeDataset(cfg.data_root, cfg.val_ids, cfg.cache_dir, cfg.predict_speed, cfg.perceive, cfg.split_stops, cfg.light_camera)
     gen = torch.Generator().manual_seed(cfg.seed)
+    # pinned batches copy to the GPU without blocking; persistent workers skip re-spawning (and re-opening every cache
+    # memmap) at each epoch, which is slow on Windows
+    loader_kw = dict(num_workers=cfg.num_workers, pin_memory=device.type == "cuda", persistent_workers=cfg.num_workers > 0)
     excluded = excluded_rows(cfg.data_root, train_set._index)
     if cfg.balance_commands or cfg.balance_curves or cfg.balance_stops or cfg.boost_red_approach != 1.0 or cfg.boost_yield != 1.0 or excluded.any():
         cmds = np.array([int(train_set._arrays[eid]["command"][i]) for eid, i in train_set._index])
@@ -201,10 +206,10 @@ def train(cfg: TrainConfig) -> dict:
             weights = weights * np.where(col("yield") > 0.5, cfg.boost_yield, 1.0)
         weights = weights * ~excluded
         sampler = WeightedRandomSampler(weights.tolist(), num_samples=len(cmds), generator=gen)
-        train_loader = DataLoader(train_set, batch_size=cfg.batch_size, sampler=sampler, num_workers=cfg.num_workers)
+        train_loader = DataLoader(train_set, batch_size=cfg.batch_size, sampler=sampler, **loader_kw)
     else:
-        train_loader = DataLoader(train_set, batch_size=cfg.batch_size, shuffle=True, generator=gen, num_workers=cfg.num_workers)
-    val_loader = DataLoader(val_set, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers)
+        train_loader = DataLoader(train_set, batch_size=cfg.batch_size, shuffle=True, generator=gen, **loader_kw)
+    val_loader = DataLoader(val_set, batch_size=cfg.batch_size, shuffle=False, **loader_kw)
 
     model = RouteSteeringNet(backbone=cfg.backbone, predict_speed=cfg.predict_speed, perceive=cfg.perceive,
                              percept_from_image=cfg.percept_from_image, split_stops=cfg.split_stops,

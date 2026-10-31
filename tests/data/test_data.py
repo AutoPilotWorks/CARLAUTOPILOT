@@ -78,8 +78,7 @@ def test_dataset_shapes(tmp_path):
     ds = EpisodeDataset(tmp_path, ids)
     assert len(ds) == 18
     item = ds[7]
-    assert item["image"].shape == (3, 32, 64) and item["image"].dtype == torch.float32
-    assert 0.0 <= float(item["image"].min()) and float(item["image"].max()) <= 1.0
+    assert item["image"].shape == (3, 32, 64) and item["image"].dtype == torch.uint8  # the model scales it to [0, 1]
     assert item["speed"].dtype == torch.float32 and item["speed"].ndim == 0
     assert item["command"].dtype == torch.int64 and int(item["command"]) in range(4)
     assert item["target"].shape == (3,) and item["target"].dtype == torch.float32
@@ -241,7 +240,7 @@ def test_light_camera_images_round_trip_through_store_cache_and_dataset(tmp_path
     cached = EpisodeDataset(tmp_path / "d", ids, cache_dir=tmp_path / "c", light=True)
     for i in range(6):
         want = load_image(tmp_path / "d", ids[0], i // 2, "light")
-        assert np.array_equal((plain[i]["light"].permute(1, 2, 0).numpy() * 255).round().astype(np.uint8), want)
+        assert np.array_equal(plain[i]["light"].permute(1, 2, 0).numpy(), want)
         assert np.array_equal(plain[i]["light"].numpy(), cached[i]["light"].numpy())
     assert "light" not in EpisodeDataset(tmp_path / "d", ids)[0]
     a = {"t": np.zeros(2), "speed": np.zeros(2, np.float32), "command": np.zeros(2, np.int64), "steer": np.zeros(2, np.float32),

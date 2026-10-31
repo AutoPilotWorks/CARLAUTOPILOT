@@ -33,6 +33,13 @@ def _light_net(pretrained: bool) -> nn.Module:
                          nn.Linear(32 * 32, 64), nn.ReLU())
 
 
+def _to_unit(x: torch.Tensor | None) -> torch.Tensor | None:
+    """uint8 pixels -> float in [0, 1] (same values as the dataset's old CPU conversion); float input passes through.
+    The training loader ships uint8 (4x fewer bytes between worker processes) and the GPU converts here. The divisor is
+    a tensor because CUDA divides by a Python scalar as x * (1/255), which is 1 ulp off for about half of the 256 values."""
+    return x.float() / x.new_tensor(255.0, dtype=torch.float32) if x is not None and x.dtype == torch.uint8 else x
+
+
 class _Normalize(nn.Module):
     def __init__(self, mean: torch.Tensor, std: torch.Tensor):
         super().__init__()
@@ -110,6 +117,7 @@ class RouteSteeringNet(nn.Module):
             self.light_red = nn.Linear(64, 1)
 
     def forward(self, image: torch.Tensor, speed: torch.Tensor, command: torch.Tensor, light: torch.Tensor | None = None) -> torch.Tensor:
+        image, light = _to_unit(image), _to_unit(light)
         img = self.backbone(image)
         feat = self.merge(torch.cat([img, self.speed(speed.view(-1, 1))], dim=1))
         all_out = torch.stack([head(feat) for head in self.heads], dim=1)

@@ -69,7 +69,7 @@ class EpisodeDataset(Dataset):
             pixels = np.array(self._mmaps[eid][i])
         else:
             pixels = load_image(self.root, eid, i)
-        image = torch.from_numpy(pixels).permute(2, 0, 1).float() / 255.0
+        image = torch.from_numpy(pixels).permute(2, 0, 1)  # uint8; RouteSteeringNet scales it to [0, 1] on the GPU
         cols = [a["steer"][i], a["throttle"][i], a["brake"][i]] + ([a["target_speed"][i]] if self.target_speed else [])
         cols += [a[k][i] for k in self.percept_keys] if self.perception else []
         target = np.array(cols, dtype=np.float32)
@@ -83,7 +83,7 @@ class EpisodeDataset(Dataset):
                 lp = np.array(self._mmaps[key][j])
             else:
                 lp = load_image(self.root, eid, j, "light")
-            item["light"] = torch.from_numpy(lp).permute(2, 0, 1).float() / 255.0
+            item["light"] = torch.from_numpy(lp).permute(2, 0, 1)
         return item | {
             "image": image,
             "speed": torch.tensor(float(a["speed"][i]), dtype=torch.float32),

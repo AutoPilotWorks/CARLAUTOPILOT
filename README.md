@@ -136,7 +136,7 @@ python -m carlautopilot.cli.carla_run eval --carla-root <CARLA 폴더> --town To
   - Town02 검사용: `check_town02_s300_*`
   - 그 밖에: `runs\`, `eval\`, 저장소 밖 분석 스크립트 `scripts\`, 작업 기록 `night_log.md`·`archive_copy_log.md`
 - **F: (보관용 1 TB 하드디스크, 2026-10-28 설치):** v1.8d·v1.9·v6·v1.10·v1.10N 데이터와 ETS2 train/val의 사본을 둡니다. 오래된 디스크라, 며칠 문제없이 버티는 것을 본 뒤에 원래 자리의 원본을 지웁니다.
-- **C:\carlautopilot_cache:** 학습 캐시입니다. 캐시가 데이터 크기와 비슷하고(v1.10 204개에 131 GB) RAM보다 커서, 디스크에서 읽는 속도가 학습 속도를 정합니다.
+- **C:\carlautopilot_cache:** 학습 캐시입니다. 캐시가 데이터 크기와 비슷하고(v1.10 204개에 131 GB) RAM보다 큽니다. 다만 디스크는 병목이 아니었습니다(2026-10-30 v1.13 학습 중 측정: 읽기 139 MB/s, 디스크 92% 유휴). 학습 메인 프로세스가 CPU 한 코어를 97% 쓰고 데이터 로더 워커 4개는 각 20%, GPU는 4~23%였습니다. 2026-10-31에 로더가 이미지를 uint8로 넘기고 GPU에서 [0, 1]로 바꾸도록 하고, pinned memory·persistent workers를 켜고, 배치마다 `loss.item()`으로 GPU를 기다리던 것을 없앴습니다. 같은 7개 주행으로 2에폭씩 돌려 비교하니 손실은 기존 코드와 모든 자리까지 같았고, 2번째 에폭의 학습은 47초에서 23초, 검증은 17초에서 2초로 줄었습니다.
 - 노트북에서 깨끗한 Windows에 CARLA를 돌리려면 DirectX 런타임(dxwebsetup)이 필요했습니다.
 
 ## 열린 질문

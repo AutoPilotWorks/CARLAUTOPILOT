@@ -64,3 +64,23 @@ def test_resnet18_backbone_output_shape_and_ranges():
     out = net(torch.rand(2, 3, 128, 256), torch.tensor([0.0, 5.0]), torch.tensor([0, 2]))
     assert out.shape == (2, 3)
     assert out[:, 0].abs().max() <= 1 and out[:, 1:].min() >= 0 and out[:, 1:].max() <= 1
+
+
+def test_uint8_images_match_float_images():
+    torch.manual_seed(0)
+    net = RouteSteeringNet(predict_speed=True, perceive=True, percept_from_image=True, split_stops=True, light_camera=True, pretrained=False).eval()
+    g = torch.Generator().manual_seed(1)
+    img, light = (torch.randint(0, 256, (4, 3, 32, 64), generator=g, dtype=torch.uint8) for _ in range(2))
+    spd, cmd = torch.rand(4, generator=g), torch.arange(4)
+    assert torch.equal(net(img, spd, cmd, light), net(img.float() / 255.0, spd, cmd, light.float() / 255.0))
+
+
+def test_uint8_scaling_on_cuda_matches_cpu():
+    import pytest
+
+    from carlautopilot.models.route_steering import _to_unit
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    x = torch.arange(256, dtype=torch.uint8)
+    assert torch.equal(_to_unit(x.cuda()).cpu(), x.float() / 255.0)  # CUDA's x / 255.0 is 1 ulp off for 126 values
