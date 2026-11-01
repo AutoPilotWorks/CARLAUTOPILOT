@@ -68,7 +68,7 @@ def test_resnet18_backbone_output_shape_and_ranges():
 
 def test_uint8_images_match_float_images():
     torch.manual_seed(0)
-    net = RouteSteeringNet(predict_speed=True, perceive=True, percept_from_image=True, split_stops=True, light_camera=True, pretrained=False).eval()
+    net = RouteSteeringNet(predict_speed=True, perceive=True, light_camera=True, pretrained=False).eval()
     g = torch.Generator().manual_seed(1)
     img, light = (torch.randint(0, 256, (4, 3, 32, 64), generator=g, dtype=torch.uint8) for _ in range(2))
     spd, cmd = torch.rand(4, generator=g), torch.arange(4)

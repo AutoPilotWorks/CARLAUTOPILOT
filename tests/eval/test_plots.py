@@ -55,3 +55,20 @@ def test_run_episode_saves_frames_before_an_event(tmp_path):
     assert "red_light" in kinds
     shots = sorted(p for p in d.iterdir() if p.name.endswith("_red_light"))
     assert shots and 0 < len(list(shots[0].glob("*_main.png"))) <= 20
+
+
+def test_live_view_frame_places_every_camera_and_the_decision():
+    import numpy as np
+
+    from carlautopilot.core import Action, Command, Observation
+    from carlautopilot.eval.live_view import compose
+
+    cams = {f: np.full((160, 320, 3), v, np.uint8) for f, v in (("left", 10), ("right", 20), ("rear", 30))}
+    obs = Observation(t=0.0, speed_mps=5.0, command=Command.LEFT, image=np.full((160, 320, 3), 40, np.uint8),
+                      extras={"light_image": np.full((172, 344, 3), 50, np.uint8), "surround_images": cams})
+    img = np.asarray(compose(obs, Action(-0.5, 0.2, 0.0), 6.0, (0.9, 12.0, 40.0, 0.1, 40.0, 15.0, -1.0)))
+    assert img.shape == (320, 960, 3)
+    # sample each tile away from its name label: LEFT FRONT RIGHT / LIGHT REAR
+    assert [int(img[y, x, 0]) for y, x in ((100, 160), (100, 480), (100, 800), (260, 160), (260, 480))] == [10, 40, 20, 50, 30]
+    plain = np.asarray(compose(Observation(t=0.0, speed_mps=0.0, command=Command.FOLLOW, image=obs.image), Action()))
+    assert plain.shape == (320, 960, 3) and int(plain[100, 160, 0]) == 0  # missing cameras are blank

@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-from carlautopilot.data.episode_store import PERCEPTION_KEYS, SPLIT_PERCEPTION_KEYS, load_image, read_episode
+from carlautopilot.data.episode_store import PERCEPT_KEYS, SURROUND_FOLDERS, load_image, read_episode
 
 
 def build_image_cache(root: str | Path, episode_id: str, cache_dir: str | Path, n: int, folder: str = "images") -> Path:
@@ -27,17 +27,21 @@ def build_image_cache(root: str | Path, episode_id: str, cache_dir: str | Path, 
 
 
 class EpisodeDataset(Dataset):
-    def __init__(self, root: str | Path, episode_ids: list[str], cache_dir: str | Path | None = None, target_speed: bool = False, perception: bool = False, split_stops: bool = False, light: bool = False):
+    def __init__(self, root: str | Path, episode_ids: list[str], cache_dir: str | Path | None = None, target_speed: bool = False, perception: bool = False, light: bool = False,
+                 surround: bool = False):
         """target_speed appends the expert's road-geometry speed label as a 4th target column; perception (with it)
-        appends PERCEPTION_KEYS as columns 5-8."""
+        appends PERCEPT_KEYS as columns 5-11. surround adds item["surround"]: the step's SURROUND_FOLDERS images
+        stacked (3, 3, H, W) uint8."""
         if not episode_ids:
             raise ValueError("episode_ids is empty")
         self.root = Path(root)
         self.target_speed = target_speed
         self.perception = perception
-        self.percept_keys = SPLIT_PERCEPTION_KEYS if split_stops else PERCEPTION_KEYS
+        self.percept_keys = PERCEPT_KEYS
         self.light = light
-        self._light_cache: dict[str, Path] = {}
+        self.surround = surround
+        self._step_folders = (("light",) if light else ()) + (SURROUND_FOLDERS if surround else ())
+        self._step_cache: dict[str, Path] = {}  # "<episode>/<folder>" -> cache file
         self._cache: dict[str, Path] = {}
         self._mmaps: dict[str, np.ndarray] = {}
         self._arrays: dict[str, dict[str, np.ndarray]] = {}
@@ -50,12 +54,22 @@ class EpisodeDataset(Dataset):
                 raise ValueError(f"{eid} has no perception labels")
             if light and "light_idx" not in arrays:
                 raise ValueError(f"{eid} has no traffic-light camera images")
+            if surround and ("light_idx" not in arrays or not (self.root / eid / SURROUND_FOLDERS[0]).is_dir()):
+                raise ValueError(f"{eid} has no surround camera images")
             self._arrays[eid] = arrays
             self._index.extend((eid, i) for i in range(len(arrays["t"])))
             if cache_dir is not None:
                 self._cache[eid] = build_image_cache(self.root, eid, cache_dir, len(arrays["t"]))
-                if light:
-                    self._light_cache[eid] = build_image_cache(self.root, eid, cache_dir, int(arrays["light_idx"].max()) + 1, "light")
+                for f in self._step_folders:
+                    self._step_cache[f"{eid}/{f}"] = build_image_cache(self.root, eid, cache_dir, int(arrays["light_idx"].max()) + 1, f)
+
+    def _step_image(self, eid: str, folder: str, j: int) -> np.ndarray:
+        key = f"{eid}/{folder}"
+        if key not in self._step_cache:
+            return load_image(self.root, eid, j, folder)
+        if key not in self._mmaps:
+            self._mmaps[key] = np.load(self._step_cache[key], mmap_mode="r")
+        return np.array(self._mmaps[key][j])
 
     def __len__(self) -> int:
         return len(self._index)
@@ -74,16 +88,13 @@ class EpisodeDataset(Dataset):
         cols += [a[k][i] for k in self.percept_keys] if self.perception else []
         target = np.array(cols, dtype=np.float32)
         item = {}
-        if self.light:
+        if self._step_folders:
             j = int(a["light_idx"][i])
-            if eid in self._light_cache:
-                key = eid + "/light"
-                if key not in self._mmaps:
-                    self._mmaps[key] = np.load(self._light_cache[eid], mmap_mode="r")
-                lp = np.array(self._mmaps[key][j])
-            else:
-                lp = load_image(self.root, eid, j, "light")
-            item["light"] = torch.from_numpy(lp).permute(2, 0, 1)
+            step = {f: torch.from_numpy(self._step_image(eid, f, j)).permute(2, 0, 1) for f in self._step_folders}
+            if self.light:
+                item["light"] = step["light"]
+            if self.surround:
+                item["surround"] = torch.stack([step[f] for f in SURROUND_FOLDERS])
         return item | {
             "image": image,
             "speed": torch.tensor(float(a["speed"][i]), dtype=torch.float32),

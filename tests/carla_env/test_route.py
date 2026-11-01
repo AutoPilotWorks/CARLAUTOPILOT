@@ -40,26 +40,6 @@ def test_dedupe_drops_repeated_points():
     assert dedupe_points([(0, 0), (0, 0.01), (1, 0), (1, 0)]) == [0, 2]
 
 
-def test_view_shift_makes_the_expert_steer_back_toward_the_route():
-    from carlautopilot.carla_env.route import points_seen_from
-    from carlautopilot.policies import PathFollowPolicy
-
-    straight = [(d, 0.0) for d in (3.0, 6.0, 9.0, 12.0, 15.0, 20.0)]
-    pol = PathFollowPolicy(max_steer_rad=1.22)
-    left_shift = points_seen_from(straight, 1.0, 0.0)
-    assert all(y == pytest.approx(-1.0) for _, y in left_shift)
-    assert pol.act(_obs(left_shift)).steer > 0.02
-    assert pol.act(_obs(points_seen_from(straight, -1.0, 0.0))).steer < -0.02
-    assert pol.act(_obs(points_seen_from(straight, 0.0, 10.0))).steer > 0.02
-    assert points_seen_from([(10.0, 0.0)], 0.0, 90.0)[0] == pytest.approx((0.0, -10.0))
-
-
-def _obs(points):
-    from carlautopilot.core import Observation
-
-    return Observation(t=0.0, speed_mps=7.0, command=Command.FOLLOW, extras={"lookahead_points": points})
-
-
 def test_junction_turn_options_relabels_a_planner_follow_turn():
     # straight east 20 m, a junction curving 90 deg left (north), straight north 20 m; planner said LANEFOLLOW (4)
     pts = [(x, 0.0) for x in range(0, 21, 2)] + [(20 + 10 * math.sin(a), 10 - 10 * math.cos(a)) for a in [k * math.pi / 16 for k in range(1, 8)]]
@@ -86,5 +66,3 @@ def test_multicam_downscale_and_light_crop():
     crop = env.light_crop(img, 120.0)
     # f = 369.5 px: 50 deg wide = 2 x 172 px; 18 deg up to 8 deg down = rows 200..372 (horizon at row 320)
     assert crop.shape == (172, 344, 3) and np.array_equal(crop[0, 0], img[200, 468])
-    with pytest.raises(ValueError):
-        env.CarlaEnv.__init__(object.__new__(env.CarlaEnv), vehicle="truck", multicam=True)

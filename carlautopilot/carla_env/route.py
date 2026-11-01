@@ -118,12 +118,6 @@ class WindowedRoute:
         return math.atan2(self.seg_dir[i, 1], self.seg_dir[i, 0])
 
 
-def points_seen_from(points: Sequence[tuple[float, float]], dy_m: float, dyaw_deg: float) -> list[tuple[float, float]]:
-    """Vehicle-frame points (x forward, y left) as seen from a pose shifted dy_m left and yawed dyaw_deg left."""
-    c, s = math.cos(-math.radians(dyaw_deg)), math.sin(-math.radians(dyaw_deg))
-    return [(x * c - (y - dy_m) * s, x * s + (y - dy_m) * c) for x, y in points]
-
-
 def dedupe_points(points: Sequence[tuple[float, float]], min_step_m: float = 0.05) -> list[int]:
     """Indices of points kept so that consecutive kept points are at least min_step_m apart."""
     keep = [0]

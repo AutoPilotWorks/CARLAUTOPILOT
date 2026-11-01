@@ -8,6 +8,7 @@ from carlautopilot.core import Command
 NUM_COMMANDS = len(Command)
 # perception labels are capped here; a lead/light distance at the cap means 'none in range'
 PERCEPT_RANGE_M = 40.0  # a red light 50 m out is often still hidden (crests, small at 160x320); stopping from 29 km/h needs ~20 m
+N_PERCEPT = 7  # perception outputs, in episode_store.PERCEPT_KEYS order
 
 
 def _resnet18(feature_dim: int, pretrained: bool) -> nn.Module:
@@ -18,6 +19,25 @@ def _resnet18(feature_dim: int, pretrained: bool) -> nn.Module:
     mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
     return nn.Sequential(_Normalize(mean, std), net)
+
+
+def _backbone(name: str, feature_dim: int, pretrained: bool) -> nn.Module:
+    if name == "resnet18":
+        return _resnet18(feature_dim, pretrained)
+    if name != "small":
+        raise ValueError("backbone must be 'small' or 'resnet18'")
+    return nn.Sequential(
+        nn.Conv2d(3, 16, 5, stride=2, padding=2),
+        nn.ReLU(),
+        nn.Conv2d(16, 32, 3, stride=2, padding=1),
+        nn.ReLU(),
+        nn.Conv2d(32, 64, 3, stride=2, padding=1),
+        nn.ReLU(),
+        nn.AdaptiveAvgPool2d((2, 4)),
+        nn.Flatten(),
+        nn.Linear(64 * 8, feature_dim),
+        nn.ReLU(),
+    )
 
 
 def _light_net(pretrained: bool) -> nn.Module:
@@ -55,90 +75,74 @@ class RouteSteeringNet(nn.Module):
 
     Output columns: steer in [-1, 1] (positive = right), throttle in [0, 1], brake in [0, 1],
     and with predict_speed a 4th: the road-geometry target speed in m/s (>= 0).
-    perceive (needs predict_speed) adds 4 more: P(red light for my lane within PERCEPT_RANGE_M), distance to its
-    stop line m, gap to the lead vehicle/pedestrian m (PERCEPT_RANGE_M = none), lead speed relative to ego m/s.
-    percept_from_image computes those 4 from the image features alone (no speed, no command): with the speed input the
-    model learned 'standing still => stop needed' (stopped frames are mostly at red lights) and never pulled away.
-    split_stops (needs percept_from_image) replaces those 4 with 7 by cause: P(red light), its stop line m, nearest stop
-    sign m (served or not; PERCEPT_RANGE_M = none), P(yield), junction entry m, lead gap m, lead relative speed m/s.
-    One merged 'stop needed' let the model stop at any stop line look and never restart after a stop sign.
-    light_camera (needs percept_from_image) adds a second, narrow image for traffic lights (see _light_net). P(red light)
-    comes from those light features alone; the other perception outputs see both images. With P(red) also fed the main
-    image, v1.10 learned 'stop line / junction ahead => red' (68% right) and ignored the light image completely.
+    perceive (needs predict_speed) adds 7 perception outputs (PERCEPT_KEYS order): P(red light for my lane within
+    PERCEPT_RANGE_M), its stop line m, nearest stop sign m (served or not), P(yield), junction entry m, lead gap m
+    (PERCEPT_RANGE_M = none), lead speed relative to ego m/s. They come from a separate head on the image features alone
+    (no speed, no command): with the speed input the truck learned 'standing still => stop needed' and never pulled away,
+    and one merged 'stop needed' output let it stop at any stop-line look and never restart after a stop sign.
+    light_camera (needs perceive) adds the traffic-light image (see _light_net). P(red light) comes from those light
+    features alone; the other perception outputs see both images. With P(red) also fed the main image, v1.10 learned
+    'stop line / junction ahead => red' (68% right) and ignored the light image completely.
+    surround adds the sedan's left/right/rear camera images (B, 3, 3, H, W) in SURROUND_FOLDERS order: one encoder shared
+    by the three (its own weights, not the front backbone's: they look down and sideways), features concatenated in that
+    fixed order next to the front features, so the driving heads and the perception head (except P(red)) see all of them.
     """
 
     def __init__(self, feature_dim: int = 128, backbone: str = "small", pretrained: bool = True, predict_speed: bool = False,
-                 perceive: bool = False, percept_from_image: bool = False, split_stops: bool = False,
-                 light_camera: bool = False):
+                 perceive: bool = False, light_camera: bool = False, surround: bool = False):
         super().__init__()
         if perceive and not predict_speed:
             raise ValueError("perceive needs predict_speed")
-        if percept_from_image and not perceive:
-            raise ValueError("percept_from_image needs perceive")
-        if split_stops and not percept_from_image:
-            raise ValueError("split_stops needs percept_from_image")
+        if light_camera and not perceive:
+            raise ValueError("light_camera needs perceive")
         self.predict_speed = predict_speed
         self.perceive = perceive
-        self.percept_from_image = percept_from_image
-        self.split_stops = split_stops
-        if light_camera and not percept_from_image:
-            raise ValueError("light_camera needs percept_from_image")
         self.light_camera = light_camera
-        n_percept = 7 if split_stops else 4
-        self.n_out = 4 + n_percept if perceive else 4 if predict_speed else 3
-        head_out = 4 if percept_from_image else self.n_out
-        if backbone == "resnet18":
-            self.backbone = _resnet18(feature_dim, pretrained)
-        elif backbone != "small":
-            raise ValueError("backbone must be 'small' or 'resnet18'")
-        else:
-            self.backbone = nn.Sequential(
-                nn.Conv2d(3, 16, 5, stride=2, padding=2),
-                nn.ReLU(),
-                nn.Conv2d(16, 32, 3, stride=2, padding=1),
-                nn.ReLU(),
-                nn.Conv2d(32, 64, 3, stride=2, padding=1),
-                nn.ReLU(),
-                nn.AdaptiveAvgPool2d((2, 4)),
-                nn.Flatten(),
-                nn.Linear(64 * 8, feature_dim),
-                nn.ReLU(),
-            )
+        self.n_out = 4 + N_PERCEPT if perceive else 4 if predict_speed else 3
+        head_out = 4 if predict_speed else 3
+        self.backbone = _backbone(backbone, feature_dim, pretrained)
+        self.surround = surround
+        if surround:
+            self.surround_net = _backbone(backbone, feature_dim, pretrained)
+        img_dim = feature_dim * (4 if surround else 1)
         self.speed = nn.Sequential(nn.Linear(1, 16), nn.ReLU())
-        self.merge = nn.Sequential(nn.Linear(feature_dim + 16, feature_dim), nn.ReLU())
+        self.merge = nn.Sequential(nn.Linear(img_dim + 16, feature_dim), nn.ReLU())
         self.heads = nn.ModuleList(
             nn.Sequential(nn.Linear(feature_dim, 64), nn.ReLU(), nn.Linear(64, head_out)) for _ in range(NUM_COMMANDS)
         )
-        if percept_from_image:
+        if perceive:
             light_dim = 64 if light_camera else 0
-            self.percept = nn.Sequential(nn.Linear(feature_dim + light_dim, 64), nn.ReLU(), nn.Linear(64, n_percept))
+            self.percept = nn.Sequential(nn.Linear(img_dim + light_dim, 64), nn.ReLU(), nn.Linear(64, N_PERCEPT))
         if light_camera:
             self.light_net = _light_net(pretrained)
             self.light_red = nn.Linear(64, 1)
 
-    def forward(self, image: torch.Tensor, speed: torch.Tensor, command: torch.Tensor, light: torch.Tensor | None = None) -> torch.Tensor:
-        image, light = _to_unit(image), _to_unit(light)
+    def forward(self, image: torch.Tensor, speed: torch.Tensor, command: torch.Tensor, light: torch.Tensor | None = None,
+                surround: torch.Tensor | None = None) -> torch.Tensor:
+        image, light, surround = _to_unit(image), _to_unit(light), _to_unit(surround)
         img = self.backbone(image)
+        if self.surround:
+            if surround is None:
+                raise ValueError("this model needs the surround camera images")
+            img = torch.cat([img, self.surround_net(surround.flatten(0, 1)).view(len(img), -1)], dim=1)
         feat = self.merge(torch.cat([img, self.speed(speed.view(-1, 1))], dim=1))
         all_out = torch.stack([head(feat) for head in self.heads], dim=1)
         idx = command.long().view(-1, 1, 1).expand(-1, 1, all_out.shape[2])
         raw = all_out.gather(1, idx).squeeze(1)
-        if self.percept_from_image:
+        if self.perceive:
             if self.light_camera:
                 if light is None:
                     raise ValueError("this model needs the traffic-light camera image")
                 lf = self.light_net(light)
                 p = self.percept(torch.cat([img, lf], dim=1))
-                p = torch.cat([self.light_red(lf), p[:, 1:]], dim=1)  # column 0 is P(red) in both percept layouts
+                p = torch.cat([self.light_red(lf), p[:, 1:]], dim=1)  # column 0 is P(red)
             else:
                 p = self.percept(img)
             raw = torch.cat([raw, p], dim=1)
         out = [torch.tanh(raw[:, :1]), torch.sigmoid(raw[:, 1:3])]
         if self.predict_speed:
             out.append(nn.functional.softplus(raw[:, 3:4]))
-        if self.split_stops:
+        if self.perceive:
             out += [torch.sigmoid(raw[:, 4:5]), nn.functional.softplus(raw[:, 5:7]), torch.sigmoid(raw[:, 7:8]),
                     nn.functional.softplus(raw[:, 8:10]), raw[:, 10:11]]
-        elif self.perceive:
-            out += [torch.sigmoid(raw[:, 4:5]), nn.functional.softplus(raw[:, 5:7]), raw[:, 7:8]]
         return torch.cat(out, dim=1)

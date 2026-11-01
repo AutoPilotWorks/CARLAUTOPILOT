@@ -108,8 +108,6 @@ def test_model_policy_acts_and_respects_ranges():
     img = np.random.default_rng(0).integers(0, 256, size=(64, 128, 3), dtype=np.uint8)
     a = pol.act(Observation(t=0.0, speed_mps=3.0, command=Command.LEFT, image=img))
     assert -1.0 <= a.steer <= 1.0 and 0.0 <= a.throttle <= 1.0 and 0.0 <= a.brake <= 1.0
-    pedals = ModelPolicy(RouteSteeringNet(), use_model_pedals=True).act(Observation(t=0.0, speed_mps=3.0, command=Command.FOLLOW, image=img))
-    assert 0.0 <= pedals.throttle <= 1.0
     with pytest.raises(ValueError):
         pol.act(Observation(t=0.0, speed_mps=3.0, command=Command.FOLLOW))
 

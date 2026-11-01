@@ -67,14 +67,15 @@ v1.9부터는 정지 표지판과 양보 규칙을 지켜야 하는 더 어려�
 ## 코드를 돌려 보는 법
 ```bash
 python -m pytest -q
-python -m carlautopilot.cli.evaluate --out-dir <새 폴더> --title "Baseline"
 ```
-CARLA 서버(`CarlaUE4.exe -RenderOffScreen`)를 켠 뒤, 지금 쓰는 설정입니다.
+CARLA 서버(`CarlaUE4.exe -RenderOffScreen`)를 켠 뒤, 지금 쓰는 설정입니다(세단 카메라 4대, 2026-10-31 정리 후 명령).
 ```bash
-python -m carlautopilot.cli.carla_run collect --carla-root <CARLA 폴더> --data-root <데이터 폴더> --town Town03_Opt --episodes 17 --seed 61 --stride 4 --views "1:0,-1:0,0:10,0:-10" --rigs "120:25" --png-compress 1 --vehicle truck_cab --image-size 160x320 --walkers 40 --junction-rules --start-delay 2 --light-camera 50:5:160x320
-python -m carlautopilot.train.train_steering --data-root <데이터 폴더> --out-dir <학습 폴더> --cache-dir <캐시 폴더> --device cuda --num-workers 4 --epochs 8 --batch-size 64 --backbone resnet18 --lr 3e-4 --amp --loss-weights 10 0.5 0.5 0.5 1 0.2 0.05 1 0.05 0.05 0.1 --predict-speed --perceive --percept-from-image --split-stops --balance-stops --boost-red-approach 3 --light-camera
-python -m carlautopilot.cli.carla_run eval --carla-root <CARLA 폴더> --town Town02_Opt --episodes 10 --seed 100 --vehicle truck_cab --image-size 160x320 --walkers 40 --junction-rules --fov 120 --turn-camera 25 --model-speed 8 --light-camera 50:5:160x320 --event-frames --checkpoint <학습 폴더>/checkpoint.pt --out-dir <평가 폴더>
+python -m carlautopilot.cli.carla_run collect --carla-root <CARLA 폴더> --data-root <데이터 폴더> --town Town03_Opt --episodes 60 --seed 111 --png-compress 1 --walkers 40 --junction-rules --start-delay 2
+python -m carlautopilot.train.train_steering --data-root <데이터 폴더> --out-dir <학습 폴더> --cache-dir <캐시 폴더> --device cuda --num-workers 4 --epochs 8 --batch-size 64 --backbone resnet18 --lr 3e-4 --amp --cosine --loss-weights 10 0.5 0.5 0.5 1 0.2 0.05 1 0.05 0.05 0.1 --predict-speed --perceive --balance-stops --boost-red-approach 3 --light-camera [--surround]
+python -m carlautopilot.cli.carla_run eval --carla-root <CARLA 폴더> --town Town02_Opt --episodes 10 --seed 100 --walkers 40 --junction-rules --model-speed 8 --event-frames [--view] --checkpoint <학습 폴더>/checkpoint.pt --out-dir <평가 폴더>
 ```
+- 기본값: 운전 영상 160×320, 전면 시야각 120°, 수집 간격(`--stride`) 4, 조향 잡음 0.05. `--surround`를 주면 모델 B(좌·우·후방 카메라 추가), 빼면 모델 A(전면 + 신호등 크롭).
+- `--view`: 모델이 보는 카메라 5개 화면과 판단(조향·페달·목표 속도·빨간불·양보·정지 표지판·앞차)을 실시간 창으로 보여 줍니다. 결과는 바뀌지 않고, 두 스텝에 한 장 그려 한 스텝에 평균 약 15 ms가 더 듭니다. 공식 평가에는 쓰지 않습니다.
 - `eval`에 `--checkpoint`가 없으면 전문가를 평가합니다. 한 번에 도시 하나만 다룹니다(맵 전환은 별도 프로세스, 이유는 architecture.md).
 - 평가 기록(`logs/*.jsonl`)에는 프레임마다 모델의 인식 출력(`percept`)과 다음 신호의 실제 거리·상태(`truth.next_light_m`, `next_light_red`)가 남습니다. `--event-frames`를 주면 사건 직전 4초 화면이 `frames/`에 저장됩니다.
 - 설치: Python 3.12 가상환경에 `requirements.txt`, CUDA용 `torch`·`torchvision`(pytorch.org의 cu132 인덱스), `carla==0.9.16`, `networkx`.

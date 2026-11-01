@@ -28,9 +28,11 @@ def run_episode(
     max_steps: int | None = None,
     penalties: dict[str, float] | None = None,
     frames_dir: str | Path | None = None,
+    view=None,
 ) -> EpisodeResult:
     """frames_dir: on every event and on a failed ending, save the last FRAME_BUFFER camera frames (every FRAME_EVERY steps)
-    as PNGs under frames_dir/<t>_<kind>/, so the scene can be looked at."""
+    as PNGs under frames_dir/<t>_<kind>/, so the scene can be looked at. view: show(obs, action, policy) every step
+    (eval.live_view.LiveView)."""
     obs = env.reset(scenario, seed)
     frames: deque = deque(maxlen=FRAME_BUFFER)
     policy.reset()
@@ -40,6 +42,8 @@ def run_episode(
     termination: str | None = None
     for step in range(limit):
         action = policy.act(obs).clipped()
+        if view is not None:
+            view.show(obs, action, policy)
         res = env.step(action)
         records.append(
             StepRecord(
@@ -96,6 +100,7 @@ def run_suite(
     penalties: dict[str, float] | None = None,
     title: str = "Evaluation report",
     event_frames: bool = False,
+    view=None,
 ) -> dict:
     out = Path(out_dir)
     if out.exists() and any(out.iterdir()):
@@ -106,7 +111,7 @@ def run_suite(
         env, policy = env_factory(), policy_factory()
         try:
             result = run_episode(env, policy, sc, log_path=out / "logs" / f"{sc.name}.jsonl", penalties=penalties,
-                                 frames_dir=out / "frames" / sc.name if event_frames else None)
+                                 frames_dir=out / "frames" / sc.name if event_frames else None, view=view)
         finally:
             env.close()
         per_episode.append(result.metrics)

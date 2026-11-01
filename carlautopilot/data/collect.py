@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from carlautopilot.core import Action, Env, Observation, Policy
-from carlautopilot.data.episode_store import PERCEPTION_KEYS, STOP_KEYS, write_episode
+from carlautopilot.data.episode_store import PERCEPT_KEYS, write_episode
 from carlautopilot.models.route_steering import PERCEPT_RANGE_M
 from carlautopilot.scenario import ScenarioSpec
 
@@ -18,28 +18,10 @@ NOISE_AR = 0.9
 TAKEOVER_M, RETURN_M = 1.5, 0.3
 
 
-def perception_labels(obs: Observation) -> tuple[float, float, float, float] | None:
-    """(must stop at a line in range, distance to it, lead gap, lead relative speed) from privileged observations.
-
-    The stored key is still "light_red": a red light for my lane, an unserved stop sign, or a junction where the
-    expert yields (stop_needed); "light_dist" is the nearest such stop line.
-    """
-    if "lookahead_points" not in obs.extras:
-        return None
-    rng = PERCEPT_RANGE_M
-    lines = [obs.extras.get(k) for k in ("next_stop_sign_distance_m", "yield_distance_m")]
-    if obs.extras.get("next_light_red"):
-        lines.append(obs.extras.get("next_light_distance_m"))
-    lines = [d for d in lines if d is not None and d <= rng]
-    red = bool(lines)
-    d = min(lines) if lines else None
-    lead = obs.lead if obs.lead is not None and obs.lead.distance_m < rng else None
-    return (float(red), d if red else rng, lead.distance_m if lead else rng, lead.rel_speed_mps if lead else 0.0)
-
-
-def stop_labels(obs: Observation) -> tuple[float, float, float, float, float] | None:
-    """(red light for my lane in range, its stop line m, nearest stop sign m (served or not), yield needed, junction entry m);
-    a distance at PERCEPT_RANGE_M means none in range."""
+def percept_labels(obs: Observation) -> tuple[float, ...] | None:
+    """PERCEPT_KEYS from privileged observations: red light for my lane in range, its stop line m, nearest stop sign m
+    (served or not), yield needed, junction entry m, lead gap m, lead relative speed m/s (0 without a lead); a distance
+    at PERCEPT_RANGE_M means none in range."""
     if "lookahead_points" not in obs.extras:
         return None
     rng = PERCEPT_RANGE_M
@@ -50,8 +32,9 @@ def stop_labels(obs: Observation) -> tuple[float, float, float, float, float] | 
 
     red = near("next_light_distance_m") if obs.extras.get("next_light_red") else None
     sign, yld = near("stop_sign_distance_m"), near("yield_distance_m")
+    lead = obs.lead if obs.lead is not None and obs.lead.distance_m < rng else None
     return (float(red is not None), rng if red is None else red, rng if sign is None else sign,
-            float(yld is not None), rng if yld is None else yld)
+            float(yld is not None), rng if yld is None else yld, lead.distance_m if lead else rng, lead.rel_speed_mps if lead else 0.0)
 
 
 def collect_episode(
@@ -64,21 +47,15 @@ def collect_episode(
     noise_seed: int = 0,
     max_steps: int | None = None,
     stride: int = 1,
-    extra_samples: Callable[[Observation, Action], list[tuple[np.ndarray, Action]]] | None = None,
     png_compress: int = 6,
-    stream_images: Callable[[Observation], list[list[np.ndarray]]] | None = None,
-    stream_roots: Sequence[str | Path] = (),
     driver: Policy | None = None,
 ) -> dict:
-    """Drive with the expert and store (image, speed, command, expert action) per step.
+    """Drive with the expert and store (image, speed, command, expert action) per step, plus the step's light crop and
+    surround camera images when the env gives them.
 
     With a driver (DAgger), the driver steers and the expert keeps the pedals and the labels: the data then covers
     the states the driver itself gets into (e.g. a model under-steering into a corner), not only the expert's.
     The expert takes over between TAKEOVER_M and RETURN_M of lateral error (needs privileged observations).
-
-    extra_samples(obs, action) may add (image, label) pairs for the same step, e.g. side cameras.
-    stream_images(obs) returns, for each extra camera rig, the images matching this step's rows (centre then the
-    extra samples); each rig is written with the same labels to the matching root in stream_roots.
 
     The executed steering gets temporally correlated noise, but the stored label is the clean
     expert action, so the dataset covers off-centre states and shows how to recover from them.
@@ -94,8 +71,7 @@ def collect_episode(
     rng = np.random.default_rng(noise_seed)
     limit = max_steps if max_steps is not None else int(scenario.max_time_s / env.dt) + 10
     noise = 0.0
-    rows, images, target_speeds, percepts, stops, lights, light_idx = [], [], [], [], [], [], []
-    streams: list[list[np.ndarray]] = []
+    rows, images, target_speeds, percepts, lights, light_idx = [], [], [], [], [], []
     surround: dict[str, list[np.ndarray]] = {}  # the sedan rig's left/right/rear cameras, one image per step like light
     termination = None
     for step in range(limit):
@@ -104,29 +80,12 @@ def collect_episode(
             rows.append((obs.t, obs.speed_mps, int(obs.command), action.steer, action.throttle, action.brake))
             images.append(obs.image)
             target_speeds.append(getattr(expert, "last_target_speed", None))
-            percepts.append(perception_labels(obs))
-            stops.append(stop_labels(obs))
+            percepts.append(percept_labels(obs))
             if "light_image" in obs.extras:
                 lights.append(obs.extras["light_image"])
                 for name, img in obs.extras.get("surround_images", {}).items():
                     surround.setdefault(name, []).append(img)
             light_idx.append(len(lights) - 1)
-            n_before = len(images) - 1
-            for img, lab in extra_samples(obs, action) if extra_samples else ():
-                rows.append((obs.t, obs.speed_mps, int(obs.command), lab.steer, lab.throttle, lab.brake))
-                images.append(img)
-                target_speeds.append(target_speeds[-1])
-                percepts.append(percepts[-1])
-                stops.append(stops[-1])
-                light_idx.append(light_idx[-1])
-            if stream_images is not None:
-                per_rig = stream_images(obs)
-                if not streams:
-                    streams.extend([] for _ in per_rig)
-                for k, imgs in enumerate(per_rig):
-                    if len(imgs) != len(images) - n_before:
-                        raise ValueError("stream images do not match the rows of this step")
-                    streams[k].extend(imgs)
         steer = action.steer
         if driver is not None:
             lat = abs(obs.extras["lateral_error_m"])
@@ -155,10 +114,7 @@ def collect_episode(
     if all(v is not None for v in target_speeds):
         arrays["target_speed"] = np.array(target_speeds, dtype=np.float32)
     if all(v is not None for v in percepts):
-        for k, col in zip(PERCEPTION_KEYS, zip(*percepts)):
-            arrays[k] = np.array(col, dtype=np.float32)
-    if all(v is not None for v in stops):
-        for k, col in zip(STOP_KEYS, zip(*stops)):
+        for k, col in zip(PERCEPT_KEYS, zip(*percepts)):
             arrays[k] = np.array(col, dtype=np.float32)
     step_images = {}
     if lights:
@@ -174,8 +130,6 @@ def collect_episode(
     }
     t_sim = time.perf_counter()
     write_episode(root, episode_id, meta, arrays, stack, png_compress, step_images)
-    for k, extra_root in enumerate(stream_roots):
-        write_episode(extra_root, episode_id, meta, arrays, np.stack(streams[k]), png_compress, step_images)
     t_end = time.perf_counter()
     info = {"episode_id": episode_id, "steps": len(rows), "termination": termination, "sim_s": round(t_sim - t_start, 1), "write_s": round(t_end - t_sim, 1)}
     if driver is not None:

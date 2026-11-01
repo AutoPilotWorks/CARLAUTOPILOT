@@ -119,21 +119,6 @@ def test_folds_errors():
         make_folds(["a", "a", "b"], 2)
 
 
-def test_collect_extra_samples_add_rows(tmp_path):
-    from carlautopilot.core import Action
-    from carlautopilot.data.collect import collect_episode
-    from carlautopilot.data.episode_store import read_episode
-    from carlautopilot.policies import PathFollowPolicy
-    from carlautopilot.scenarios_lib import straight
-    from carlautopilot.sim import FakeEnv
-
-    extra = lambda obs, a: [(obs.image, Action(0.5, a.throttle, a.brake))]
-    info = collect_episode(FakeEnv(render_images=True, privileged_obs=True), PathFollowPolicy(), straight(), tmp_path, "e", max_steps=10, extra_samples=extra)
-    _, arrays = read_episode(tmp_path, "e")
-    assert info["steps"] == 20
-    assert list(arrays["steer"][1::2]) == [0.5] * 10
-
-
 def test_collect_stores_expert_target_speed_only_when_available(tmp_path):
     from carlautopilot.core import Action
     from carlautopilot.data.collect import collect_episode
@@ -142,10 +127,9 @@ def test_collect_stores_expert_target_speed_only_when_available(tmp_path):
     from carlautopilot.scenarios_lib import straight
     from carlautopilot.sim import FakeEnv
 
-    extra = lambda obs, a: [(obs.image, a)]
-    collect_episode(FakeEnv(render_images=True, privileged_obs=True), PathFollowPolicy(speed_limit_mps=8.0, max_lat_accel=2.0), straight(), tmp_path, "e", max_steps=10, extra_samples=extra)
+    collect_episode(FakeEnv(render_images=True, privileged_obs=True), PathFollowPolicy(speed_limit_mps=8.0, max_lat_accel=2.0), straight(), tmp_path, "e", max_steps=10)
     _, arrays = read_episode(tmp_path, "e")
-    assert len(arrays["target_speed"]) == len(arrays["steer"]) == 20
+    assert len(arrays["target_speed"]) == len(arrays["steer"]) == 10
     assert float(arrays["target_speed"].max()) == 8.0
     collect_episode(FakeEnv(render_images=True), ConstantPolicy(Action(0.0, 0.3, 0.0)), straight(), tmp_path, "c", max_steps=5)
     assert "target_speed" not in read_episode(tmp_path, "c")[1]
@@ -188,42 +172,23 @@ def test_image_cache_matches_png_and_png_level_is_lossless(tmp_path):
     assert all((load_image(tmp_path / "p", "lvl1", i) == imgs[i]).all() for i in range(3))
 
 
-def test_collect_stores_perception_labels_capped_at_range():
-    from carlautopilot.core import LeadInfo, Observation, Command
-    from carlautopilot.data.collect import perception_labels
-
-    base = dict(t=0.0, speed_mps=5.0, command=Command.FOLLOW)
-    assert perception_labels(Observation(**base)) is None
-    far = Observation(**base, lead=LeadInfo(80.0, -1.0), extras={"lookahead_points": [(1.0, 0.0)], "next_light_red": True, "next_light_distance_m": 70.0})
-    assert perception_labels(far) == (0.0, 40.0, 40.0, 0.0)
-    near = Observation(**base, lead=LeadInfo(12.0, -1.5), extras={"lookahead_points": [(1.0, 0.0)], "next_light_red": True, "next_light_distance_m": 20.0})
-    assert perception_labels(near) == (1.0, 20.0, 12.0, -1.5)
-
-
-def test_stop_needed_label_takes_the_nearest_stop_sign_yield_or_red_light():
-    from carlautopilot.core import Command, Observation
-    from carlautopilot.data.collect import perception_labels
-
-    base = dict(t=0.0, speed_mps=5.0, command=Command.FOLLOW)
-    ex = {"lookahead_points": [(1.0, 0.0)], "next_light_red": False, "next_light_distance_m": 10.0}
-    assert perception_labels(Observation(**base, extras=ex))[:2] == (0.0, 40.0)
-    assert perception_labels(Observation(**base, extras={**ex, "yield_distance_m": 15.0, "next_stop_sign_distance_m": 25.0}))[:2] == (1.0, 15.0)
-    assert perception_labels(Observation(**base, extras={**ex, "next_light_red": True, "yield_distance_m": 15.0}))[:2] == (1.0, 10.0)
-
-
-def test_stop_labels_split_by_cause_and_keep_served_signs():
-    from carlautopilot.core import Command, Observation
-    from carlautopilot.data.collect import stop_labels
+def test_percept_labels_split_by_cause_capped_at_range_and_keep_served_signs():
+    from carlautopilot.core import Command, LeadInfo, Observation
+    from carlautopilot.data.collect import percept_labels
 
     base = {"lookahead_points": [(5.0, 0.0)]}
-    obs = lambda **x: Observation(t=0.0, speed_mps=0.0, command=Command.FOLLOW, extras={**base, **x})
-    assert stop_labels(Observation(t=0.0, speed_mps=0.0, command=Command.FOLLOW)) is None
-    assert stop_labels(obs()) == (0.0, 40.0, 40.0, 0.0, 40.0)
-    assert stop_labels(obs(next_light_distance_m=12.0, next_light_red=False)) == (0.0, 40.0, 40.0, 0.0, 40.0)
-    assert stop_labels(obs(next_light_distance_m=12.0, next_light_red=True)) == (1.0, 12.0, 40.0, 0.0, 40.0)
+    obs = lambda lead=None, **x: Observation(t=0.0, speed_mps=0.0, command=Command.FOLLOW, lead=lead, extras={**base, **x})
+    none = (0.0, 40.0, 40.0, 0.0, 40.0, 40.0, 0.0)
+    assert percept_labels(Observation(t=0.0, speed_mps=0.0, command=Command.FOLLOW)) is None  # not privileged
+    assert percept_labels(obs()) == none
+    assert percept_labels(obs(next_light_distance_m=12.0, next_light_red=False)) == none
+    assert percept_labels(obs(next_light_distance_m=70.0, next_light_red=True)) == none  # beyond range
+    assert percept_labels(obs(next_light_distance_m=12.0, next_light_red=True))[:2] == (1.0, 12.0)
     # a served sign (no next_stop_sign_distance_m) is still seen
-    assert stop_labels(obs(stop_sign_distance_m=7.0, yield_distance_m=9.0)) == (0.0, 40.0, 7.0, 1.0, 9.0)
-    assert stop_labels(obs(stop_sign_distance_m=60.0)) == (0.0, 40.0, 40.0, 0.0, 40.0)
+    assert percept_labels(obs(stop_sign_distance_m=7.0, yield_distance_m=9.0))[:5] == (0.0, 40.0, 7.0, 1.0, 9.0)
+    assert percept_labels(obs(stop_sign_distance_m=60.0)) == none
+    assert percept_labels(obs(LeadInfo(12.0, -1.5)))[5:] == (12.0, -1.5)
+    assert percept_labels(obs(LeadInfo(80.0, -1.0)))[5:] == (40.0, 0.0)
 
 
 def test_light_camera_images_round_trip_through_store_cache_and_dataset(tmp_path):

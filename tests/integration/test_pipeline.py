@@ -3,7 +3,6 @@ import json
 import pytest
 
 from carlautopilot.core import Action, EventKind, Policy
-from carlautopilot.cli.evaluate import main as evaluate_main
 from carlautopilot.eval import read_episode
 from carlautopilot.policies import ConstantPolicy, PathFollowPolicy
 from carlautopilot.runner import run_episode, run_suite
@@ -111,17 +110,6 @@ def test_run_suite_outputs(tmp_path):
     assert len(list((tmp_path / "out" / "logs").glob("*.jsonl"))) == 8
     with pytest.raises(FileExistsError):
         run_suite(env, PathFollowPolicy, standard_suite(), tmp_path / "out")
-
-
-def test_cli_with_json_scenarios(tmp_path):
-    d = tmp_path / "sc"
-    d.mkdir()
-    straight(80.0, name="s80").save(d / "s80.json")
-    red_light(name="rl").save(d / "rl.json")
-    res = evaluate_main(["--out-dir", str(tmp_path / "res"), "--scenarios-dir", str(d)])
-    assert res["aggregate"]["episodes"] == 2
-    data = json.loads((tmp_path / "res" / "metrics.json").read_text(encoding="utf-8"))
-    assert {e["scenario"] for e in data["episodes"]} == {"s80", "rl"}
 
 
 def test_scenarios_are_valid_and_roundtrip(tmp_path):

@@ -27,29 +27,18 @@ from carlautopilot.sim.fake_env import (
 )
 
 VEHICLE = "vehicle.lincoln.mkz_2020"
-# outside the cab front (face at ~3.97 m): at x=3.0 the steering wheel shows and at x=3.5 the wipers, mirror and
-# cab body show in the side-shifted/rotated views, all of which leak the steering label (v1.8 collapsed on it);
-# x=4.1 is clean in every view x turn-camera swing. ETS2 masks its cab, so only the road view has to match
-CAB_EYE_X, CAB_EYE_Y, CAB_EYE_Z = 4.1, -0.6, 2.6
 WALKER_CROSS_FACTOR = 0.2
 YIELD_LOOK_M = 30.0  # yield is checked while the junction entry is at most this far ahead
 YIELD_HORIZON_S, YIELD_STEP_S = 4.0, 0.25
 YIELD_MIN_EGO_MPS = 3.0  # a stopped ego is assumed to pull away at this speed when predicting conflicts
 YIELD_CLEAR_M = {"vehicle": 2.8, "walker": 2.0}
-WHEELBASE_M = 2.86
+WHEELBASE_M = 2.86  # measured 2026-10-21
 MAX_STEER_RAD = math.radians(70.0)
-# name -> (blueprint, wheelbase m, max front-wheel steer rad, camera x m, camera y m (CARLA, + right), camera z m)
-# measured 2026-10-21/24; truck_cab puts the camera at the left-hand driver's eye, like ETS2's interior view
-VEHICLES = {
-    "sedan": (VEHICLE, WHEELBASE_M, MAX_STEER_RAD, 1.5, 0.0, 1.6),
-    "truck": ("vehicle.carlamotors.european_hgv", 4.42, math.radians(70.0), 4.1, 0.0, 2.4),
-    "truck_cab": ("vehicle.carlamotors.european_hgv", 4.42, math.radians(70.0), CAB_EYE_X, CAB_EYE_Y, CAB_EYE_Z),
-}
-TURN_CAMERA_RATE_DEG_S = 25.0
-# sedan multi-camera rig (stage 1 probe 2026-10-31, D:\carlautopilot_data\rig_probe): the front camera renders at
+FRONT_CAMERA = (1.5, 0.0, 1.6)  # x, y, z m in the vehicle frame
+# sedan camera rig (stage 1 probe 2026-10-31, D:\carlautopilot_data\rig_probe): the front camera renders at
 # MULTICAM_SCALE x the image size; the driving image is its box-downscale and the traffic-light image a native-res crop,
-# so one physical front camera replaces the separate light camera. At 120 deg / 1280 px a light head at 40 m is ~3.5x11 px
-# (the truck's 50 deg / 320 px light camera: 3.3x10). Surround cameras at the mirrors and above the rear plate, name ->
+# so one physical front camera replaces the truck's separate light camera. At 120 deg / 1280 px a light head at 40 m is
+# ~3.5x11 px (the truck's 50 deg / 320 px light camera: 3.3x10). Surround cameras at the mirrors and above the rear plate, name ->
 # (x, y, z, yaw, pitch, fov) in the vehicle frame (CARLA, y right): 150 deg at the mirrors halves the ground blind area
 # within 2 m of the body vs 120 deg (8.1 vs 16.8 m2 at pitch -20/-25).
 MULTICAM_SCALE = 4
@@ -125,47 +114,24 @@ class CarlaEnv:
         render_images: bool = True,
         privileged_obs: bool = False,
         timeout_s: float = 60.0,
-        extra_views: tuple[tuple[float, float], ...] = (),
         follow_spectator: bool = True,
-        vehicle: str = "sedan",
-        rigs: tuple[tuple[float, float], ...] = ((90.0, 0.0),),
+        fov: float = 120.0,
         junction_rules: bool = False,
-        light_camera: tuple[float, float, int, int] | None = None,
-        multicam: bool = False,
     ):
-        """extra_views: additional cameras as (offset left m, yaw left deg); their images go to extras["view_images"].
-
-        rigs: camera sets as (fov deg, turn camera deg). Rig 0 gives obs.image (+ view_images); every rig has the centre
-        camera plus extra_views, and rigs 1.. go to extras["rig_images"] as [centre, *views]. A nonzero turn camera angle
-        swings the whole rig toward the route command (LEFT +, RIGHT -) at TURN_CAMERA_RATE_DEG_S; labels do not change
-        because the vehicle pose does not.
+        """The sedan camera rig (see SURROUND_CAMERAS): one fixed front camera (fov deg) rendered at MULTICAM_SCALE x
+        image_size gives obs.image (downscaled) and extras["light_image"] (light_crop), and extras["surround_images"]
+        holds {left, right, rear} at image_size.
 
         junction_rules: stop signs on the route must be served (halt in STOP_SIGN_ZONE_M for STOP_SIGN_HOLD_S, else a
         STOP_SIGN event), and privileged extras gain next_stop_sign_distance_m and yield_distance_m (junction entry ahead
         while a vehicle/pedestrian is predicted, at constant velocity, to cross the ego's path inside the junction).
-
-        light_camera: (fov deg, pitch up deg, height, width) of a narrow, never-swung camera at the same eye point for
-        traffic lights; its image goes to extras["light_image"] (also without privileged_obs). At 120 deg / 320 px a light
-        head across a junction (~45 m) is ~1x3 px and the model could not read its colour.
-
-        multicam: the sedan rig (see SURROUND_CAMERAS): one fixed front camera rendered at MULTICAM_SCALE x image_size
-        gives obs.image (downscaled) and extras["light_image"] (light_crop), and extras["surround_images"] holds
-        {left, right, rear} at image_size. Needs the sedan, one rig without a turn camera, no extra views or light camera.
         """
-        if multicam and (vehicle != "sedan" or len(rigs) != 1 or rigs[0][1] or extra_views or light_camera):
-            raise ValueError("multicam needs the sedan, one rig without a turn camera, and no extra views or light camera")
-        self.multicam = multicam
         self._surround_queues: dict[str, queue.Queue] = {}
         self._surround_images: dict[str, np.ndarray] = {}
-        self.light_camera = light_camera
-        self._light_queue: queue.Queue | None = None
         self._light_image: np.ndarray | None = None
-        self.vehicle = vehicle
         self.junction_rules = junction_rules
-        self.blueprint, self.wheelbase_m, self.max_steer_rad, self.cam_x, self.cam_y, self.cam_z = VEHICLES[vehicle]
-        self.rigs = tuple(rigs)
+        self.fov = fov
         self.dt = dt
-        self.extra_views = tuple(extra_views)
         self.follow_spectator = follow_spectator
         self.image_size = image_size
         self.render_images = render_images
@@ -180,12 +146,8 @@ class CarlaEnv:
         self._npcs: list[int] = []
         self._ego = None
         self._scenario: ScenarioSpec | None = None
-        self._queues: list[queue.Queue] = []
-        self._cams: list[tuple[int, float, float, object]] = []
-        self._rig_yaw: list[float] = [0.0] * len(self.rigs)
+        self._front_queue: queue.Queue | None = None
         self._last_image: np.ndarray | None = None
-        self._view_images: list[np.ndarray] = []
-        self._rig_images: list[list[np.ndarray]] = []
 
     def check_town(self, town: str) -> None:
         name = self.world.get_map().name
@@ -265,48 +227,16 @@ class CarlaEnv:
 
         x, y, z, yaw = meta["start"]
         start = carla.Transform(carla.Location(x=x, y=y, z=z + 0.5), carla.Rotation(yaw=yaw))
-        self._ego = self.world.spawn_actor(bpl.find(self.blueprint), start)
+        self._ego = self.world.spawn_actor(bpl.find(VEHICLE), start)
         self._actors.append(self._ego)
 
-        self._queues = []
-        self._cams = []
-        self._rig_yaw = [0.0] * len(self.rigs)
+        self._front_queue, self._surround_queues = None, {}
         if self.render_images:
-            k = MULTICAM_SCALE if self.multicam else 1
-            for r, (fov, _) in enumerate(self.rigs):
-                cam_bp = bpl.find("sensor.camera.rgb")
-                cam_bp.set_attribute("image_size_x", str(self.image_size[1] * k))
-                cam_bp.set_attribute("image_size_y", str(self.image_size[0] * k))
-                cam_bp.set_attribute("fov", str(fov))
-                for dy, dyaw in ((0.0, 0.0),) + self.extra_views:
-                    cam = self.world.spawn_actor(cam_bp, self._mount(dy, dyaw), attach_to=self._ego)
-                    q: queue.Queue = queue.Queue()
-                    cam.listen(q.put)
-                    self._queues.append(q)
-                    self._cams.append((r, dy, dyaw, cam))
-                    self._actors.append(cam)
-        self._surround_queues = {}
-        if self.render_images and self.multicam:
+            h, w = self.image_size
+            x, y, z = FRONT_CAMERA
+            self._front_queue = self._camera(bpl, w * MULTICAM_SCALE, h * MULTICAM_SCALE, self.fov, carla.Transform(carla.Location(x=x, y=y, z=z)))
             for name, (x, y, z, yaw, pitch, fov) in SURROUND_CAMERAS.items():
-                bp = bpl.find("sensor.camera.rgb")
-                bp.set_attribute("image_size_x", str(self.image_size[1]))
-                bp.set_attribute("image_size_y", str(self.image_size[0]))
-                bp.set_attribute("fov", str(fov))
-                cam = self.world.spawn_actor(bp, carla.Transform(carla.Location(x=x, y=y, z=z), carla.Rotation(pitch=pitch, yaw=yaw)), attach_to=self._ego)
-                self._surround_queues[name] = queue.Queue()
-                cam.listen(self._surround_queues[name].put)
-                self._actors.append(cam)
-        self._light_queue = None
-        if self.render_images and self.light_camera:
-            fov, pitch, h, w = self.light_camera
-            bp = bpl.find("sensor.camera.rgb")
-            bp.set_attribute("image_size_x", str(w))
-            bp.set_attribute("image_size_y", str(h))
-            bp.set_attribute("fov", str(fov))
-            cam = self.world.spawn_actor(bp, carla.Transform(carla.Location(x=self.cam_x, y=self.cam_y, z=self.cam_z), carla.Rotation(pitch=pitch)), attach_to=self._ego)
-            self._light_queue = queue.Queue()
-            cam.listen(self._light_queue.put)
-            self._actors.append(cam)
+                self._surround_queues[name] = self._camera(bpl, w, h, fov, carla.Transform(carla.Location(x=x, y=y, z=z), carla.Rotation(pitch=pitch, yaw=yaw)))
         self._collisions: list = []
         col = self.world.spawn_actor(bpl.find("sensor.other.collision"), carla.Transform(), attach_to=self._ego)
         col.listen(self._collisions.append)
@@ -472,20 +402,16 @@ class CarlaEnv:
                     return entry - self._s
         return None
 
-    def _mount(self, dy: float, dyaw: float):
-        return carla.Transform(carla.Location(x=self.cam_x, y=self.cam_y - dy, z=self.cam_z), carla.Rotation(yaw=-dyaw))
-
-    def _swing_turn_cameras(self) -> None:
-        cmd = self._command()
-        for r, (_, turn_deg) in enumerate(self.rigs):
-            if not turn_deg:
-                continue
-            target = turn_deg if cmd == Command.LEFT else -turn_deg if cmd == Command.RIGHT else 0.0
-            step = TURN_CAMERA_RATE_DEG_S * self.dt
-            self._rig_yaw[r] += max(-step, min(step, target - self._rig_yaw[r]))
-            for rig, dy, dyaw, cam in self._cams:
-                if rig == r:
-                    cam.set_transform(self._mount(dy, dyaw + self._rig_yaw[r]))
+    def _camera(self, bpl, width: int, height: int, fov: float, mount) -> queue.Queue:
+        bp = bpl.find("sensor.camera.rgb")
+        bp.set_attribute("image_size_x", str(width))
+        bp.set_attribute("image_size_y", str(height))
+        bp.set_attribute("fov", str(fov))
+        cam = self.world.spawn_actor(bp, mount, attach_to=self._ego)
+        q: queue.Queue = queue.Queue()
+        cam.listen(q.put)
+        self._actors.append(cam)
+        return q
 
     @staticmethod
     def _read(q: queue.Queue, frame: int) -> np.ndarray:
@@ -498,18 +424,11 @@ class CarlaEnv:
 
     def _tick(self) -> None:
         frame = self.world.tick()
-        images = [self._read(q, frame) for q in self._queues]
-        if self._light_queue is not None:
-            self._light_image = self._read(self._light_queue, frame)
+        if self._front_queue is not None:
+            front = self._read(self._front_queue, frame)
+            self._light_image = light_crop(front, self.fov)
+            self._last_image = box_downscale(front, MULTICAM_SCALE)
         self._surround_images = {n: self._read(q, frame) for n, q in self._surround_queues.items()}
-        if images and self.multicam:
-            self._light_image = light_crop(images[0], self.rigs[0][0])
-            images[0] = box_downscale(images[0], MULTICAM_SCALE)
-        if images:
-            k = 1 + len(self.extra_views)
-            groups = [images[i:i + k] for i in range(0, len(images), k)]
-            self._last_image, self._view_images = groups[0][0], groups[0][1:]
-            self._rig_images = groups[1:]
 
     def _follow(self, tr) -> None:
         back = tr.get_forward_vector()
@@ -568,8 +487,6 @@ class CarlaEnv:
             dx, dy = px - self.x, py - self.y
             pts.append((dx * c - dy * s, dx * s + dy * c))
         extras = {
-            "view_images": self._view_images,
-            "rig_images": self._rig_images,
             "heading_error_rad": _wrap(self.yaw - self._route.heading_at(self._s)),
             "lateral_error_m": self._lat,
             "lookahead_points": pts,
@@ -596,9 +513,8 @@ class CarlaEnv:
     def _observe(self) -> Observation:
         image = self._last_image if self.render_images else None
         extras = self._extras()
-        if self._light_queue is not None or (self.multicam and self.render_images):
+        if self.render_images:
             extras["light_image"] = self._light_image
-        if self._surround_images:
             extras["surround_images"] = self._surround_images
         return Observation(t=self.t, speed_mps=self.v, command=self._command(), image=image, lead=self._lead_info(), extras=extras)
 
@@ -614,8 +530,6 @@ class CarlaEnv:
             raise RuntimeError("episode finished; call reset()")
         a = action.clipped()
         self._ego.apply_control(carla.VehicleControl(throttle=a.throttle, steer=a.steer, brake=a.brake))
-        if self.render_images:
-            self._swing_turn_cameras()
         prev_s = self._s
         self._tick()
         self.t += self.dt

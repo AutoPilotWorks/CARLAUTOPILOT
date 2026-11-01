@@ -37,11 +37,10 @@ class TrainConfig:
     resume: bool = False
     predict_speed: bool = False
     perceive: bool = False
-    percept_from_image: bool = False
     balance_curves: bool = False
-    split_stops: bool = False
     balance_stops: bool = False
     light_camera: bool = False
+    surround: bool = False
     boost_red_approach: float = 1.0
     boost_yield: float = 1.0
     cosine: bool = False
@@ -65,26 +64,15 @@ def _bce(p: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 
 def _weighted_l1(pred: torch.Tensor, target: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    if pred.shape[1] == 11:
-        # split stops: red BCE, its line only when red, sign distance always (range = none), yield BCE, its entry only
-        # when yielding, lead gap always, relative speed only with a lead
-        red, yld, has_lead = target[:, 4], target[:, 7], (target[:, 9] < PERCEPT_RANGE_M).float()
-        terms = [
-            _bce(pred[:, 4], red), (pred[:, 5] - target[:, 5]).abs() * red, (pred[:, 6] - target[:, 6]).abs(),
-            _bce(pred[:, 7], yld), (pred[:, 8] - target[:, 8]).abs() * yld,
-            (pred[:, 9] - target[:, 9]).abs(), (pred[:, 10] - target[:, 10]).abs() * has_lead,
-        ]
-        return (((pred[:, :4] - target[:, :4]).abs() * w[:4]).sum(dim=1) + sum(w[4 + k] * t for k, t in enumerate(terms))).mean()
     if pred.shape[1] <= 4:
         return ((pred - target).abs() * w).sum(dim=1).mean()
-    # perception columns: red-light BCE, stop distance only when red, lead gap always, relative speed only with a lead
-    red, has_lead = target[:, 4], (target[:, 6] < PERCEPT_RANGE_M).float()
-    p = pred[:, 4].clamp(1e-4, 1 - 1e-4)
+    # perception: red BCE, its line only when red, sign distance always (range = none), yield BCE, its entry only when
+    # yielding, lead gap always, relative speed only with a lead
+    red, yld, has_lead = target[:, 4], target[:, 7], (target[:, 9] < PERCEPT_RANGE_M).float()
     terms = [
-        -(red * torch.log(p) + (1 - red) * torch.log(1 - p)),
-        (pred[:, 5] - target[:, 5]).abs() * red,
-        (pred[:, 6] - target[:, 6]).abs(),
-        (pred[:, 7] - target[:, 7]).abs() * has_lead,
+        _bce(pred[:, 4], red), (pred[:, 5] - target[:, 5]).abs() * red, (pred[:, 6] - target[:, 6]).abs(),
+        _bce(pred[:, 7], yld), (pred[:, 8] - target[:, 8]).abs() * yld,
+        (pred[:, 9] - target[:, 9]).abs(), (pred[:, 10] - target[:, 10]).abs() * has_lead,
     ]
     return (((pred[:, :4] - target[:, :4]).abs() * w[:4]).sum(dim=1) + sum(w[4 + k] * t for k, t in enumerate(terms))).mean()
 
@@ -146,9 +134,9 @@ def _run_epoch(model, loader, device, w, optimizer=None, scaler=None) -> float:
     with torch.set_grad_enabled(train):
         for batch in loader:
             image, speed, command, target = (batch[k].to(device, non_blocking=True) for k in ("image", "speed", "command", "target"))
-            light = batch["light"].to(device, non_blocking=True) if "light" in batch else None
+            light, surround = (batch[k].to(device, non_blocking=True) if k in batch else None for k in ("light", "surround"))
             with torch.autocast(device.type, enabled=scaler is not None):
-                loss = _weighted_l1(model(image, speed, command, light).float(), target, w)
+                loss = _weighted_l1(model(image, speed, command, light, surround).float(), target, w)
             if train:
                 optimizer.zero_grad()
                 if scaler is None:
@@ -169,10 +157,9 @@ def train(cfg: TrainConfig) -> dict:
     last = out / "last.pt"
     if out.exists() and any(out.iterdir()) and not (cfg.resume and last.exists()):
         raise FileExistsError(f"refusing to write into non-empty {out} (use resume to continue from {last.name})")
-    if len(cfg.loss_weights) != ((11 if cfg.split_stops else 8) if cfg.perceive else 4 if cfg.predict_speed else 3):
+    if len(cfg.loss_weights) != (11 if cfg.perceive else 4 if cfg.predict_speed else 3):
         raise ValueError("loss_weights needs 3 values (steer throttle brake), 4 with predict_speed (+ target speed), "
-                         "8 with perceive (+ red light, stop distance, lead gap, lead relative speed), 11 with split_stops "
-                         "(+ red, its line, stop sign, yield, its entry, lead gap, lead relative speed)")
+                         "11 with perceive (+ red, its line, stop sign, yield, its entry, lead gap, lead relative speed)")
     if set(cfg.train_ids) & set(cfg.val_ids):
         raise ValueError("train and validation episodes overlap")
     out.mkdir(parents=True, exist_ok=True)
@@ -181,8 +168,8 @@ def train(cfg: TrainConfig) -> dict:
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
 
-    train_set = EpisodeDataset(cfg.data_root, cfg.train_ids, cfg.cache_dir, cfg.predict_speed, cfg.perceive, cfg.split_stops, cfg.light_camera)
-    val_set = EpisodeDataset(cfg.data_root, cfg.val_ids, cfg.cache_dir, cfg.predict_speed, cfg.perceive, cfg.split_stops, cfg.light_camera)
+    train_set = EpisodeDataset(cfg.data_root, cfg.train_ids, cfg.cache_dir, cfg.predict_speed, cfg.perceive, cfg.light_camera, cfg.surround)
+    val_set = EpisodeDataset(cfg.data_root, cfg.val_ids, cfg.cache_dir, cfg.predict_speed, cfg.perceive, cfg.light_camera, cfg.surround)
     gen = torch.Generator().manual_seed(cfg.seed)
     # pinned batches copy to the GPU without blocking; persistent workers skip re-spawning (and re-opening every cache
     # memmap) at each epoch, which is slow on Windows
@@ -212,8 +199,7 @@ def train(cfg: TrainConfig) -> dict:
     val_loader = DataLoader(val_set, batch_size=cfg.batch_size, shuffle=False, **loader_kw)
 
     model = RouteSteeringNet(backbone=cfg.backbone, predict_speed=cfg.predict_speed, perceive=cfg.perceive,
-                             percept_from_image=cfg.percept_from_image, split_stops=cfg.split_stops,
-                             light_camera=cfg.light_camera).to(device)
+                             light_camera=cfg.light_camera, surround=cfg.surround).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     scaler = torch.amp.GradScaler("cuda") if cfg.amp and device.type == "cuda" else None
     w = torch.tensor(cfg.loss_weights, dtype=torch.float32, device=device)
@@ -263,13 +249,12 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--loss-weights", type=float, nargs="+", default=None, help="steer throttle brake [target_speed]")
     p.add_argument("--predict-speed", action="store_true", help="also learn the expert's road-geometry target speed (m/s)")
     p.add_argument("--balance-curves", action="store_true", help="balance (command, slow bend / fast) cells; needs target_speed labels")
-    p.add_argument("--perceive", action="store_true", help="also learn red light / lead from the image (needs --predict-speed)")
-    p.add_argument("--percept-from-image", action="store_true", help="perception outputs from the image alone (no speed input)")
-    p.add_argument("--split-stops", action="store_true", help="perception by cause: red light, stop sign, yield (needs --percept-from-image)")
-    p.add_argument("--balance-stops", action="store_true", help="balance (standing/moving, stop needed) cells; needs --split-stops data")
-    p.add_argument("--light-camera", action="store_true", help="feed the traffic-light camera images to the perception head")
-    p.add_argument("--boost-red-approach", type=float, default=1.0, help="draw frames driving up to a red light (< 30 m) this many times more often; needs --split-stops data")
-    p.add_argument("--boost-yield", type=float, default=1.0, help="draw yield frames this many times more often; needs --split-stops data")
+    p.add_argument("--perceive", action="store_true", help="also learn red light, stop sign, yield and lead from the image (needs --predict-speed)")
+    p.add_argument("--balance-stops", action="store_true", help="balance (standing/moving, stop needed) cells; needs perception labels")
+    p.add_argument("--light-camera", action="store_true", help="feed the traffic-light crop to the perception head (needs --perceive)")
+    p.add_argument("--surround", action="store_true", help="also feed the sedan's left/right/rear cameras")
+    p.add_argument("--boost-red-approach", type=float, default=1.0, help="draw frames driving up to a red light (< 30 m) this many times more often; needs perception labels")
+    p.add_argument("--boost-yield", type=float, default=1.0, help="draw yield frames this many times more often; needs perception labels")
     p.add_argument("--cosine", action="store_true", help="cosine learning-rate decay over the epochs (per epoch)")
     p.add_argument("--balance-commands", action="store_true")
     p.add_argument("--amp", action="store_true", help="mixed precision (CUDA only)")
@@ -280,9 +265,9 @@ def main(argv: list[str] | None = None) -> None:
     if not 0 <= a.fold < len(folds):
         p.error("--fold is out of range")
     train_ids, val_ids = folds[a.fold]
-    split = [1.0, 0.5, 0.5, 0.5, 1.0, 0.05, 0.05, 1.0, 0.05, 0.05, 0.1]
-    weights = a.loss_weights or ((split if a.split_stops else [1.0, 0.5, 0.5, 0.5, 1.0, 0.05, 0.05, 0.1]) if a.perceive else [1.0, 0.5, 0.5, 0.5] if a.predict_speed else [1.0, 0.5, 0.5])
-    result = train(TrainConfig(a.data_root, train_ids, val_ids, a.out_dir, a.epochs, a.batch_size, a.lr, a.device, a.seed, a.num_workers, loss_weights=weights, backbone=a.backbone, balance_commands=a.balance_commands, amp=a.amp, cache_dir=a.cache_dir, resume=a.resume, predict_speed=a.predict_speed, perceive=a.perceive, percept_from_image=a.percept_from_image, balance_curves=a.balance_curves, split_stops=a.split_stops, balance_stops=a.balance_stops, light_camera=a.light_camera,
+    perceive = [1.0, 0.5, 0.5, 0.5, 1.0, 0.05, 0.05, 1.0, 0.05, 0.05, 0.1]
+    weights = a.loss_weights or (perceive if a.perceive else [1.0, 0.5, 0.5, 0.5] if a.predict_speed else [1.0, 0.5, 0.5])
+    result = train(TrainConfig(a.data_root, train_ids, val_ids, a.out_dir, a.epochs, a.batch_size, a.lr, a.device, a.seed, a.num_workers, loss_weights=weights, backbone=a.backbone, balance_commands=a.balance_commands, amp=a.amp, cache_dir=a.cache_dir, resume=a.resume, predict_speed=a.predict_speed, perceive=a.perceive, balance_curves=a.balance_curves, balance_stops=a.balance_stops, light_camera=a.light_camera, surround=a.surround,
                                  boost_red_approach=a.boost_red_approach, boost_yield=a.boost_yield, cosine=a.cosine))
     print(json.dumps(result["history"][-1]))
 

@@ -16,22 +16,7 @@ def test_speed_cap_slows_for_tight_turns_only_when_enabled():
     assert p.speed_cap([(-1.0, 0.0)]) == 8.0
 
 
-def test_model_policy_caps_speed_at_junction_commands():
-    import numpy as np
-
-    from carlautopilot.core import Command, Observation
-    from carlautopilot.models.route_steering import RouteSteeringNet
-    from carlautopilot.policies.model_policy import ModelPolicy
-
-    img = np.zeros((32, 64, 3), dtype=np.uint8)
-    pol = ModelPolicy(RouteSteeringNet(), speed_limit_mps=8.0, turn_speed_mps=4.5)
-    fast = dict(t=0.0, speed_mps=7.0, image=img)
-    assert pol.act(Observation(command=Command.FOLLOW, **fast)).brake == 0.0
-    turning = pol.act(Observation(command=Command.LEFT, **fast))
-    assert turning.brake > 0.0 and turning.throttle == 0.0
-
-
-def test_learned_speed_replaces_the_junction_rule():
+def test_learned_speed_sets_the_acc_limit():
     import numpy as np
     import torch
 
@@ -44,10 +29,12 @@ def test_learned_speed_replaces_the_junction_rule():
         for head in net.heads:
             head[-1].weight.zero_()
             head[-1].bias[3] = 3.0 if head is net.heads[Command.FOLLOW] else 9.0
-    pol = ModelPolicy(net, speed_limit_mps=8.0, turn_speed_mps=4.5)
+    pol = ModelPolicy(net, speed_limit_mps=8.0)
     obs = dict(t=0.0, speed_mps=7.0, image=np.zeros((32, 64, 3), dtype=np.uint8))
-    assert pol.act(Observation(command=Command.FOLLOW, **obs)).brake > 0.0
-    assert pol.act(Observation(command=Command.LEFT, **obs)).brake == 0.0
+    assert pol.act(Observation(command=Command.FOLLOW, **obs)).brake > 0.0  # learned 3 m/s
+    assert pol.last_target_speed == pytest.approx(3.0, abs=0.1)
+    assert pol.act(Observation(command=Command.LEFT, **obs)).brake == 0.0  # learned 9, road limit 8
+    assert pol.last_target_speed == 8.0
 
 
 def test_perceiving_model_uses_its_own_red_light_and_lead_not_the_simulators():
@@ -63,7 +50,9 @@ def test_perceiving_model_uses_its_own_red_light_and_lead_not_the_simulators():
         with torch.no_grad():
             for head in net.heads:
                 head[-1].weight.zero_()
-                head[-1].bias.copy_(torch.tensor([0.0, 0.0, 0.0, 9.0, red_logit, 6.0, lead_gap, -2.0]))
+                head[-1].bias.copy_(torch.tensor([0.0, 0.0, 0.0, 9.0]))
+            net.percept[-1].weight.zero_()  # red, its line, stop sign (none), yield (no), its entry, lead gap, lead rel
+            net.percept[-1].bias.copy_(torch.tensor([red_logit, 6.0, 60.0, -9.0, 40.0, lead_gap, -2.0]))
         return ModelPolicy(net, speed_limit_mps=8.0)
 
     img = np.zeros((32, 64, 3), dtype=np.uint8)
@@ -109,7 +98,7 @@ def test_model_policy_serves_a_seen_stop_sign_once_then_forgets_it():
     from carlautopilot.models.route_steering import RouteSteeringNet
     from carlautopilot.policies.model_policy import ModelPolicy
 
-    pol = ModelPolicy(RouteSteeringNet(predict_speed=True, perceive=True, percept_from_image=True, split_stops=True))
+    pol = ModelPolicy(RouteSteeringNet(predict_speed=True, perceive=True))
     pol.reset()
     assert pol._stop_sign(25.0, 5.0, 0.05) == [25.0]
     assert pol._stop_sign(7.0, 0.0, 0.5) == [7.0]
@@ -118,13 +107,3 @@ def test_model_policy_serves_a_seen_stop_sign_once_then_forgets_it():
     for _ in range(25):
         pol._stop_sign(40.0, 5.0, 0.05)  # no sign for 1.25 s
     assert pol._stop_sign(30.0, 5.0, 0.05) == [30.0]  # the next sign must be served again
-
-
-def test_model_policy_holds_at_a_red_light_once_standing():
-    from carlautopilot.policies.model_policy import ModelPolicy
-    from carlautopilot.policies.pathfollow import LIGHT_STOP_MARGIN_M
-
-    assert ModelPolicy._red_stop(0.9, 20.0, 5.0, True) == [20.0]  # approaching: stop at the predicted line
-    assert ModelPolicy._red_stop(0.9, 15.0, 0.0, True) == [LIGHT_STOP_MARGIN_M]  # standing: hold, whatever the distance says
-    assert ModelPolicy._red_stop(0.3, 15.0, 0.0, True) == []  # no longer red: go
-    assert ModelPolicy._red_stop(0.9, 15.0, 0.0, False) == [15.0]  # default: always the predicted line
