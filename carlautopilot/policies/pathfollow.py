@@ -11,9 +11,10 @@ LIGHT_STOP_MARGIN_M = 3.0
 LIGHT_REACT_DISTANCE_M = 80.0
 
 
-def stop_accel(acc: ACCController, speed: float, dist: float) -> float:
-    """IDM deceleration toward a stop line dist m ahead, treated as a stationary obstacle."""
-    return acc.idm.accel(speed, max(dist - LIGHT_STOP_MARGIN_M, 0.1), speed)
+def stop_accel(acc: ACCController, speed: float, dist: float, margin_m: float = LIGHT_STOP_MARGIN_M) -> float:
+    """IDM deceleration toward a stop line dist m ahead, treated as a stationary obstacle margin_m before the line
+    (the car halts the IDM standstill gap before that)."""
+    return acc.idm.accel(speed, max(dist - margin_m, 0.1), speed)
 
 
 @dataclass
@@ -50,6 +51,9 @@ class PathFollowPolicy:
     # otherwise (97% of standstill frames were labelled stop), and the model learned 'at a stop line => stop'
     start_delay_max_s: float = 0.0
     start_delay_seed: int = 0
+    # collection only: where to halt at a red light. The default expert always stood ~7.2 m before the line, so a model
+    # never saw (and could not judge) a red line nearer than that, crept toward it and lost the light at 2-4 m (11-01)
+    light_stop_margin_m: float = LIGHT_STOP_MARGIN_M
     name: str = "pathfollow"
 
     def reset(self) -> None:
@@ -73,16 +77,16 @@ class PathFollowPolicy:
         # road-geometry speed (curvature cap), stored as a label so a model can learn speed later
         self.last_target_speed = self.speed_cap(points)
         accel = self.acc.accel(obs, self.last_target_speed)
-        stops = []
+        stops = []  # (distance, margin)
         dist = obs.extras.get("next_light_distance_m")
         if obs.extras.get("next_light_red") and dist is not None:
-            stops.append(dist)
+            stops.append((dist, self.light_stop_margin_m))
         for key in ("next_stop_sign_distance_m", "yield_distance_m"):
             if key in obs.extras:
-                stops.append(obs.extras[key])
-        stops = [d for d in stops if d < LIGHT_REACT_DISTANCE_M]
-        for dist in stops:
-            accel = min(accel, stop_accel(self.acc, obs.speed_mps, dist))
+                stops.append((obs.extras[key], LIGHT_STOP_MARGIN_M))
+        stops = [(d, m) for d, m in stops if d < LIGHT_REACT_DISTANCE_M]
+        for dist, margin in stops:
+            accel = min(accel, stop_accel(self.acc, obs.speed_mps, dist, margin))
         if self.start_delay_max_s > 0:
             accel = self._delayed_start(obs, bool(stops), accel)
         throttle, brake = self.acc.pedals(accel)

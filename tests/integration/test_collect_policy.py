@@ -120,3 +120,47 @@ def test_model_policy_loads_checkpoint(tmp_path):
     pol = ModelPolicy.from_checkpoint(tmp_path / "run" / "checkpoint.pt")
     img = np.zeros((64, 128, 3), dtype=np.uint8)
     assert -1.0 <= pol.act(Observation(t=0.0, speed_mps=1.0, command=Command.FOLLOW, image=img)).steer <= 1.0
+
+
+def test_collect_log_names_what_the_car_hit(tmp_path):
+    import dataclasses
+
+    from carlautopilot.scenario import LeadVehicleSpec
+
+    class Coast:
+        def reset(self):
+            pass
+
+        def act(self, obs):
+            return Action(0.0, 0.0, 0.0)
+
+    sc = dataclasses.replace(straight(), lead=LeadVehicleSpec(20.0, ((0.0, 0.0),)), meta={"initial_speed_mps": 10.0})
+    info = collect_episode(render_env(), Coast(), sc, tmp_path, "e0")
+    assert info["termination"] == "collision" and info["collision"][0] == "collision_vehicle"
+    assert "collision" not in collect_episode(render_env(), PathFollowPolicy(), straight(60.0), tmp_path, "e1")
+
+
+def test_recovery_views_add_rows_labelled_to_steer_back(tmp_path):
+    from carlautopilot.data.episode_store import read_episode
+
+    class ViewEnv(FakeEnv):
+        extra_views = ((1.0, 0.0), (-1.0, 0.0))
+
+        def _observe(self):
+            obs = super()._observe()
+            obs.extras["view_images"] = [obs.image, obs.image]  # the fake renders no shifted camera; labels are the point
+            return obs
+
+    info = collect_episode(ViewEnv(render_images=True, privileged_obs=True), PathFollowPolicy(), straight(40.0), tmp_path, "e0", stride=5)
+    _, a = read_episode(tmp_path, "e0")
+    assert info["steps"] == 3 * (info["steps"] // 3) and a["view"][:3].tolist() == [0, 1, 2]
+    centre, left, right = (a["steer"][a["view"] == k] for k in range(3))
+    assert (left[2:] > centre[2:] + 0.01).all() and (right[2:] < centre[2:] - 0.01).all()  # seen from the left: steer right
+
+
+def test_expert_light_stop_sets_where_it_halts():
+    from carlautopilot.cli.carla_run import ACC
+    from carlautopilot.policies.pathfollow import stop_accel
+
+    # 6 m before a red line at 3 m/s: aiming for 2 m before it brakes less than aiming for the default ~7 m
+    assert stop_accel(ACC, 3.0, 6.0, 2.0 - ACC.idm.s0) > stop_accel(ACC, 3.0, 6.0)

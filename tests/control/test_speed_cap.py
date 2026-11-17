@@ -107,3 +107,35 @@ def test_model_policy_serves_a_seen_stop_sign_once_then_forgets_it():
     for _ in range(25):
         pol._stop_sign(40.0, 5.0, 0.05)  # no sign for 1.25 s
     assert pol._stop_sign(30.0, 5.0, 0.05) == [30.0]  # the next sign must be served again
+
+
+def test_model_tracks_a_red_light_through_one_bad_frame_holds_at_the_line_and_fuses_radar():
+    import numpy as np
+    import torch
+
+    from carlautopilot.core import Command, LeadInfo, Observation
+    from carlautopilot.models.route_steering import RouteSteeringNet
+    from carlautopilot.policies.model_policy import RED_RELEASE_S, ModelPolicy
+
+    net = RouteSteeringNet(predict_speed=True, perceive=True)
+    with torch.no_grad():
+        for head in net.heads:
+            head[-1].weight.zero_()
+            head[-1].bias.copy_(torch.tensor([0.0, 0.0, 0.0, 9.0]))
+        net.percept[-1].weight.zero_()
+
+    def percept(red_logit, red_d=6.0, lead=60.0):
+        with torch.no_grad():
+            net.percept[-1].bias.copy_(torch.tensor([red_logit, red_d, 60.0, -9.0, 40.0, lead, -2.0]))
+
+    pol = ModelPolicy(net, speed_limit_mps=8.0)
+    pol.reset()
+    img = np.zeros((32, 64, 3), dtype=np.uint8)
+    obs = lambda t, v, **kw: Observation(t=t, speed_mps=v, command=Command.FOLLOW, image=img, **kw)
+    percept(9.0)
+    assert pol.act(obs(0.0, 0.0)).brake == 1.0  # stopped at a red 6 m out: held, no creeping
+    percept(-9.0)
+    assert pol.act(obs(0.05, 0.0)).brake > 0.0  # one frame reads clear: still red
+    assert pol.act(obs(0.1 + RED_RELEASE_S, 0.0)).throttle > 0.0  # clear for RED_RELEASE_S: go
+    radar = {"radar_lead": LeadInfo(3.0, -5.0)}
+    assert pol.act(obs(1.0, 5.0, extras=radar)).brake > 0.0  # the camera sees nothing, the radar 3 m out closing fast

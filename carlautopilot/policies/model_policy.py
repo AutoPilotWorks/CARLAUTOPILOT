@@ -14,6 +14,8 @@ from carlautopilot.policies.pathfollow import stop_accel
 from carlautopilot.sim.fake_env import BLOCKED_SPEED_MPS, STOP_SIGN_HOLD_S, STOP_SIGN_ZONE_M
 
 SIGN_RESET_S = 1.0  # a served stop sign is forgotten once no sign is seen near (within the zone + 5 m) for this long
+RED_RELEASE_S = 0.5  # a tracked red light is released after reading clear this long
+HOLD_SPEED_MPS, HOLD_LINE_M = 0.5, 12.0  # standstill hold at a red whose line is predicted within HOLD_LINE_M
 
 
 @dataclass
@@ -49,6 +51,7 @@ class ModelPolicy:
 
     def reset(self) -> None:
         self._sign_served, self._sign_hold, self._sign_away, self._last_t = False, 0.0, 0.0, None
+        self._red_on, self._red_clear, self._red_d = False, 0.0, PERCEPT_RANGE_M
 
     @torch.no_grad()
     def act(self, obs: Observation) -> Action:
@@ -76,20 +79,38 @@ class ModelPolicy:
         dt = 0.0 if self._last_t is None else max(obs.t - self._last_t, 0.0)
         self._last_t = obs.t
         stops: list[float] = []
+        hold = False
         if self.model.perceive:
             p_red, red_d, sign_d, p_yield, yield_d, lead_d, lead_rel = self.last_percept = tuple(float(v) for v in out[4:11])
-            if p_red > 0.5:
-                stops.append(red_d)
+            # light state tracking (rule): one frame of 'not red' does not release a red; it must read clear for
+            # RED_RELEASE_S (single-frame flips at the line let A run 21 reds, 11-01)
+            self._red_clear = 0.0 if p_red > 0.5 else self._red_clear + dt
+            if p_red > 0.5 or (self._red_on and self._red_clear < RED_RELEASE_S):
+                self._red_on, self._red_d = True, red_d if p_red > 0.5 else self._red_d
+                stops.append(self._red_d)
+                # standstill hold (rule, like a production ACC at a stop): stopped at a red near its line, stay put
+                # instead of creeping on a distance estimate (A crept from ~6 m into views it had never seen)
+                hold = obs.speed_mps < HOLD_SPEED_MPS and self._red_d < HOLD_LINE_M
+            else:
+                self._red_on = False
             if p_yield > 0.5:
                 stops.append(yield_d)
             stops += self._stop_sign(sign_d, obs.speed_mps, dt)
-            obs = replace(obs, lead=LeadInfo(lead_d, lead_rel) if lead_d < PERCEPT_RANGE_M - 2.0 else None)
+            lead = LeadInfo(lead_d, lead_rel) if lead_d < PERCEPT_RANGE_M - 2.0 else None
+            radar = obs.extras.get("radar_lead")
+            # late fusion (rule): the nearer of the camera's and the radar's in-path obstacle; the camera cannot see the
+            # 0-4 m below the bonnet (12% of those leads seen), the radar can
+            if radar is not None and (lead is None or radar.distance_m < lead.distance_m):
+                lead = radar
+            obs = replace(obs, lead=lead)
         limit = self.speed_limit_mps
         if self.model.predict_speed:
             limit = self.last_target_speed = min(limit, float(out[3]))
         accel = self.acc.accel(obs, limit)
         for d in stops:
             accel = min(accel, stop_accel(self.acc, obs.speed_mps, d))
+        if hold:
+            accel = -self.acc.max_brake_decel
         throttle, brake = self.acc.pedals(accel)
         return apply_safety(Action(steer, throttle, brake), obs, self.safety)
 

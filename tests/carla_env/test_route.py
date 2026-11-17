@@ -66,3 +66,67 @@ def test_multicam_downscale_and_light_crop():
     crop = env.light_crop(img, 120.0)
     # f = 369.5 px: 50 deg wide = 2 x 172 px; 18 deg up to 8 deg down = rows 200..372 (horizon at row 320)
     assert crop.shape == (172, 344, 3) and np.array_equal(crop[0, 0], img[200, 468])
+
+
+def test_body_ahead_sees_a_tail_in_the_lane_when_the_centre_is_beside_it():
+    r = WindowedRoute([(0, 0), (100, 0)])
+    # 12 m bus turned 60 deg off the route: centre 4.3 m to the side, tail corner at 0.8 m
+    bus = [(19.0, 0.8), (21.2, 2.0), (25.0, 9.2), (22.8, 8.0)]
+    assert abs(r.project(22.0, 4.6)[1]) > 1.8  # the old centre test missed it
+    assert r.body_ahead(bus, 5.0, 45.0, 1.3) == pytest.approx(19.0)
+    assert r.body_ahead([(x, y + 3.5) for x, y in bus], 5.0, 45.0, 1.3) is None  # next lane over
+    assert r.body_ahead([(x - 20.0, y) for x, y in bus], 5.0, 45.0, 1.3) is None  # behind us
+    box = lambda cy, hw: [(20 + sx * 5.14, cy + sy * hw) for sx in (-1, 1) for sy in (-1, 1)]
+    assert r.body_ahead(box(0.0, 1.97), 5.0, 45.0, 1.3) == pytest.approx(14.86)  # 3.9 m wide bus centred: every corner outside
+    assert r.body_ahead(box(3.5, 1.97), 5.0, 45.0, 1.3) is None  # same bus one lane over
+
+
+def test_radar_points_turn_into_sensor_frame_and_drop_road_returns():
+    import numpy as np
+
+    from carlautopilot.carla_env.route import radar_local, radar_obstacle_mask
+
+    # [velocity, azimuth, altitude, depth]: 10 m dead ahead level, 10 m 30 deg right, a road return 6 deg down at 6 m
+    pts = np.array([[-2.0, 0.0, 0.0, 10.0], [0.0, math.radians(30), 0.0, 10.0], [0.0, 0.0, math.radians(-6), 6.0]], dtype=np.float32)
+    local = radar_local(pts)
+    assert local[0] == pytest.approx([10.0, 0.0, 0.0], abs=1e-4)
+    assert local[1] == pytest.approx([8.660, 5.0, 0.0], abs=1e-3)
+    assert radar_obstacle_mask(local, mount_z=0.6).tolist() == [True, True, False]  # 0.6 - 0.63 m: the road
+
+
+def test_points_seen_from_a_camera_shifted_left_lie_to_its_right():
+    from carlautopilot.carla_env.route import points_seen_from
+
+    assert points_seen_from([(10.0, 0.0)], 1.0, 0.0) == [pytest.approx((10.0, -1.0))]
+    x, y = points_seen_from([(10.0, 0.0)], 0.0, 10.0)[0]  # camera yawed 10 deg left: the point is right of its axis
+    assert y < 0 and x == pytest.approx(10.0 * math.cos(math.radians(10)))
+
+
+def test_path_walkers_stand_on_the_lane_edge_or_cross_from_beyond_it():
+    import random
+
+    from carlautopilot.carla_env.route import path_walker_plan
+
+    r = WindowedRoute([(0, 0), (300, 0)])
+    plans = path_walker_plan(r, random.Random(3), 40)
+    along = [p for p in plans if p["mode"] == "along"]
+    cross = [p for p in plans if p["mode"] == "cross"]
+    assert len(along) == len(cross) == 20
+    assert all(40.0 <= p["s"] <= 270.0 for p in plans)
+    assert all(-2.5 <= p["lat"] <= -1.75 and abs(math.sin(p["heading"])) < 1e-9 for p in along)  # right edge outside the 1.3 m corridor, along the road
+    for p in cross:  # starts beyond the lane and walks toward the other side
+        assert abs(p["lat"]) > 4.0 and math.sin(p["heading"]) * p["lat"] < 0 and 25.0 <= p["trigger_m"] <= 40.0
+
+
+def test_lead_brake_cars_start_ahead_slower_than_the_ego_and_brake_in_separate_windows():
+    import random
+
+    from carlautopilot.carla_env.route import lead_brake_plan
+
+    plans = lead_brake_plan(WindowedRoute([(0, 0), (300, 0)]), random.Random(5), 2)
+    assert [round(p["s"] - 15.0 * k) >= 25 and p["s"] - 15.0 * k <= 45.0 for k, p in enumerate(plans)] == [True, True]
+    for p in plans:
+        assert 18.0 <= p["speed_kmh"] <= 26.0  # below the expert's 8 m/s (28.8 km/h), so the ego closes in
+        ends = [t + d for t, d in p["brakes"]]
+        assert p["brakes"][0][0] >= 10.0 and all(1.5 <= d <= 5.0 for _, d in p["brakes"])
+        assert all(nxt >= end + 10.0 for end, (nxt, _) in zip(ends, p["brakes"][1:]))  # >= 10 s of driving between stops

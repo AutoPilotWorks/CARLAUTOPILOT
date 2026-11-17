@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import copy
 import math
 import time
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
 
+from carlautopilot.carla_env.route import points_seen_from
 from carlautopilot.core import Action, Env, Observation, Policy
 from carlautopilot.data.episode_store import PERCEPT_KEYS, write_episode
 from carlautopilot.models.route_steering import PERCEPT_RANGE_M
@@ -71,21 +74,31 @@ def collect_episode(
     rng = np.random.default_rng(noise_seed)
     limit = max_steps if max_steps is not None else int(scenario.max_time_s / env.dt) + 10
     noise = 0.0
-    rows, images, target_speeds, percepts, lights, light_idx = [], [], [], [], [], []
+    rows, images, target_speeds, percepts, lights, light_idx, views = [], [], [], [], [], [], []
     surround: dict[str, list[np.ndarray]] = {}  # the sedan rig's left/right/rear cameras, one image per step like light
-    termination = None
+    view_poses = getattr(env, "extra_views", ())
+    labeler = copy.deepcopy(expert)  # steers the recovery views from their own pose; the expert's own state stays clean
+    termination, collision = None, None
     for step in range(limit):
         action = expert.act(obs).clipped()
         if step % stride == 0:
-            rows.append((obs.t, obs.speed_mps, int(obs.command), action.steer, action.throttle, action.brake))
-            images.append(obs.image)
-            target_speeds.append(getattr(expert, "last_target_speed", None))
-            percepts.append(percept_labels(obs))
             if "light_image" in obs.extras:
                 lights.append(obs.extras["light_image"])
                 for name, img in obs.extras.get("surround_images", {}).items():
                     surround.setdefault(name, []).append(img)
-            light_idx.append(len(lights) - 1)
+            # recovery views: the same step seen from a shifted/yawed camera, labelled with the expert's steer from that
+            # pose (pedals, speed and perception labels are the front camera's); they share the step's light image
+            shots = [(obs.image, action.steer)] + [
+                (img, labeler.act(replace(obs, extras={**obs.extras, "lookahead_points": points_seen_from(obs.extras["lookahead_points"], dy, dyaw)})).clipped().steer)
+                for (dy, dyaw), img in zip(view_poses, obs.extras.get("view_images", ()))
+            ]
+            for k, (img, steer_label) in enumerate(shots):
+                rows.append((obs.t, obs.speed_mps, int(obs.command), steer_label, action.throttle, action.brake))
+                images.append(img)
+                target_speeds.append(getattr(expert, "last_target_speed", None))
+                percepts.append(percept_labels(obs))
+                light_idx.append(len(lights) - 1)
+                views.append(k)
         steer = action.steer
         if driver is not None:
             lat = abs(obs.extras["lateral_error_m"])
@@ -99,6 +112,7 @@ def collect_episode(
         obs = res.obs
         if res.done:
             termination = res.termination
+            collision = next(([e.kind, e.detail] for e in res.events if e.kind.startswith("collision_")), None)
             break
     if not rows:
         raise ValueError("no steps recorded")
@@ -116,6 +130,8 @@ def collect_episode(
     if all(v is not None for v in percepts):
         for k, col in zip(PERCEPT_KEYS, zip(*percepts)):
             arrays[k] = np.array(col, dtype=np.float32)
+    if view_poses:
+        arrays["view"] = np.array(views, dtype=np.int64)
     step_images = {}
     if lights:
         arrays["light_idx"] = np.array(light_idx, dtype=np.int64)
@@ -132,6 +148,8 @@ def collect_episode(
     write_episode(root, episode_id, meta, arrays, stack, png_compress, step_images)
     t_end = time.perf_counter()
     info = {"episode_id": episode_id, "steps": len(rows), "termination": termination, "sim_s": round(t_sim - t_start, 1), "write_s": round(t_end - t_sim, 1)}
+    if collision is not None:
+        info["collision"] = collision  # [kind, other actor's type_id] (laptop's idea, 11-01)
     if driver is not None:
         info.update(takeovers=takeovers, driver_share=round(driver_steps / (step + 1), 3))
     return info

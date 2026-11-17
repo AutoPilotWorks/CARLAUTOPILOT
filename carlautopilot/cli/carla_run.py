@@ -30,11 +30,18 @@ def make_scenarios(env: CarlaEnv, a: argparse.Namespace) -> list[ScenarioSpec]:
     ]
 
 
-def expert(speed: float, start_delay_max_s: float = 0.0, start_delay_seed: int = 0) -> PathFollowPolicy:
+def expert(speed: float, start_delay_max_s: float = 0.0, start_delay_seed: int = 0, light_stop_m: float | None = None) -> PathFollowPolicy:
+    """light_stop_m: halt this far before a red light's line (default: LIGHT_STOP_MARGIN_M + the IDM standstill gap)."""
+    margin = {} if light_stop_m is None else {"light_stop_margin_m": light_stop_m - ACC.idm.s0}
     # the short pure-pursuit look-ahead stops junction corner cutting (2026-10-23)
     return PathFollowPolicy(speed_limit_mps=speed, wheelbase_m=WHEELBASE_M, max_steer_rad=MAX_STEER_RAD, acc=ACC, max_lat_accel=2.0,
                             lookahead_gain=0.5, lookahead_offset_m=2.0, lookahead_min_m=3.0,
-                            start_delay_max_s=start_delay_max_s, start_delay_seed=start_delay_seed)
+                            start_delay_max_s=start_delay_max_s, start_delay_seed=start_delay_seed, **margin)
+
+
+def parse_pairs(spec: str) -> tuple[tuple[float, float], ...]:
+    """'a:b,c:d' -> ((a, b), (c, d))"""
+    return tuple((float(p), float(q)) for p, q in (v.split(":") for v in spec.split(",") if v))
 
 
 def collect(a: argparse.Namespace, env: CarlaEnv) -> None:
@@ -51,9 +58,15 @@ def collect(a: argparse.Namespace, env: CarlaEnv) -> None:
             continue
         sc.save(root / "scenarios" / f"{eid}.json")
         t0 = time.time()
-        info = collect_episode(env, expert(a.speed, a.start_delay, zlib.crc32(eid.encode())), sc, root, eid, steer_noise_std=a.noise,
+        stop_m = None
+        if a.light_stop:
+            (lo, hi), = parse_pairs(a.light_stop)
+            stop_m = round(random.Random(zlib.crc32(eid.encode())).uniform(lo, hi), 2)
+        info = collect_episode(env, expert(a.speed, a.start_delay, zlib.crc32(eid.encode()), stop_m), sc, root, eid, steer_noise_std=a.noise,
                                noise_seed=zlib.crc32(eid.encode()), stride=a.stride, png_compress=a.png_compress, driver=driver)
         info["wall_s"] = round(time.time() - t0, 1)
+        if stop_m is not None:
+            info["light_stop_m"] = stop_m
         info["weather"] = sc.meta["weather"]
         if a.dagger:
             info["driver"] = a.dagger
@@ -101,6 +114,10 @@ def main(argv: list[str] | None = None) -> None:
         q.add_argument("--host", default="localhost")
         q.add_argument("--port", type=int, default=2000)
         q.add_argument("--tm-port", type=int, default=8000, help="Traffic Manager port; give each parallel CARLA server its own")
+        q.add_argument("--walker-cross", type=float, default=0.2, help="share of pedestrians that cross roads")
+        q.add_argument("--path-walkers", type=int, default=0, help="scripted pedestrians per episode along the lane edge / crossing ahead")
+        q.add_argument("--lead-brakes", type=int, default=0, help="cars put ahead on the route that brake to a stop now and then")
+        q.add_argument("--radar", action="store_true", help="front radar; a perceiving model fuses its in-path obstacle with the camera's")
     c = sub.choices["collect"]
     c.add_argument("--data-root", required=True)
     c.add_argument("--noise", type=float, default=0.05)
@@ -108,6 +125,8 @@ def main(argv: list[str] | None = None) -> None:
     c.add_argument("--start-delay", type=float, default=0.0, help="expert waits a random 0..this s after a stop reason clears (reaction time)")
     c.add_argument("--png-compress", type=int, default=6, help="PNG zlib level 0-9 (lossless); lower is faster, files larger")
     c.add_argument("--dagger", help="checkpoint that steers while the expert labels (DAgger)")
+    c.add_argument("--views", default="", help="recovery cameras as left_offset_m:left_yaw_deg, comma separated, e.g. 1:0,-1:0,0:10,0:-10")
+    c.add_argument("--light-stop", default="", help="lo:hi m: the expert halts a uniform random lo..hi m before red-light lines (per episode)")
     e = sub.choices["eval"]
     e.add_argument("--out-dir", required=True)
     e.add_argument("--checkpoint")
@@ -119,7 +138,8 @@ def main(argv: list[str] | None = None) -> None:
     switch_map(a.town, a.host, a.port)
     h, w = (int(v) for v in a.image_size.lower().split("x"))
     env = CarlaEnv(a.host, a.port, tm_port=a.tm_port, image_size=(h, w), fov=a.fov, junction_rules=a.junction_rules,
-                   privileged_obs=a.mode == "collect" or a.checkpoint is None)
+                   privileged_obs=a.mode == "collect" or a.checkpoint is None, radar=a.radar, walker_cross=a.walker_cross, path_walkers=a.path_walkers, lead_brakes=a.lead_brakes,
+                   extra_views=parse_pairs(a.views) if a.mode == "collect" else ())
     try:
         collect(a, env) if a.mode == "collect" else evaluate(a, env)
     finally:

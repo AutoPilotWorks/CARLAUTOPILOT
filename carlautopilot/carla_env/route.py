@@ -117,6 +117,36 @@ class WindowedRoute:
         i = int(min(max(np.searchsorted(self.cum, s, side="right") - 1, 0), len(self.seg_len) - 1))
         return math.atan2(self.seg_dir[i, 1], self.seg_dir[i, 0])
 
+    def body_ahead(self, corners: Sequence[tuple[float, float]], s0: float, s_max: float, half_m: float) -> float | None:
+        """Smallest route position of a body's footprint corners that lies ahead of s0 and within half_m of the route.
+        Corners, not the centre: a bus turning off the route can have its centre beside the lane while its tail still
+        blocks it (Town03_Opt_111_022 drove into one, 2026-10-31). A body wider than the corridor (bus, fire truck) centred
+        on the route has every corner outside it, so corners on both sides of the corridor block it too (11-02: the
+        expert drove into 11 of 40 Town01 routes)."""
+        pts = [(s, lat) for s, lat, _ in (self.project(x, y, s0, s_max) for x, y in corners) if s > s0]
+        ahead = [s for s, lat in pts if abs(lat) < half_m]
+        if not ahead and pts and min(lat for _, lat in pts) <= -half_m and max(lat for _, lat in pts) >= half_m:
+            ahead = [s for s, _ in pts]
+        return min(ahead, default=None)
+
+
+def points_seen_from(points: Sequence[tuple[float, float]], dy_m: float, dyaw_deg: float) -> list[tuple[float, float]]:
+    """Vehicle-frame points (x forward, y left) as seen from a pose shifted dy_m left and yawed dyaw_deg left."""
+    c, s = math.cos(-math.radians(dyaw_deg)), math.sin(-math.radians(dyaw_deg))
+    return [(x * c - (y - dy_m) * s, x * s + (y - dy_m) * c) for x, y in points]
+
+
+def radar_local(points: np.ndarray) -> np.ndarray:
+    """CARLA radar detections (N, 4) [velocity, azimuth, altitude, depth] -> (N, 3) sensor-frame x forward, y right, z up."""
+    _, az, alt, depth = points.T
+    return np.stack([depth * np.cos(alt) * np.cos(az), depth * np.cos(alt) * np.sin(az), depth * np.sin(alt)], axis=1)
+
+
+def radar_obstacle_mask(local: np.ndarray, mount_z: float, min_h: float = 0.3, max_h: float = 2.5) -> np.ndarray:
+    """Detections between min_h and max_h above the road: drops road-surface returns and overhead signs or bridges."""
+    h = local[:, 2] + mount_z
+    return (h > min_h) & (h < max_h)
+
 
 def dedupe_points(points: Sequence[tuple[float, float]], min_step_m: float = 0.05) -> list[int]:
     """Indices of points kept so that consecutive kept points are at least min_step_m apart."""
@@ -126,3 +156,44 @@ def dedupe_points(points: Sequence[tuple[float, float]], min_step_m: float = 0.0
         if math.hypot(b[0] - a[0], b[1] - a[1]) >= min_step_m:
             keep.append(i)
     return keep
+
+
+def lead_brake_plan(route: WindowedRoute, rng, n: int, max_time_s: float = 400.0) -> list[dict]:
+    """Cars ahead on the ego's route that drive slower than it (so it catches up) and brake to a stop now and then
+    (Euro NCAP CCRm/CCRb-like; 11-02: moving with something within 8 m was ~0.5% of the smoke data, bar 1%). Each gets
+    route s (25-45 m ahead of the start, 15 m apart), a desired speed and brake windows (start s, duration s) in
+    episode time."""
+    plans = []
+    for k in range(n):
+        brakes, t = [], rng.uniform(10.0, 20.0)
+        while t < max_time_s:
+            d = rng.uniform(1.5, 5.0)
+            brakes.append((t, d))
+            t += d + rng.uniform(10.0, 25.0)
+        plans.append({"s": min(rng.uniform(25.0, 45.0) + 15.0 * k, max(route.length - 20.0, 0.0)), "speed_kmh": rng.uniform(18.0, 26.0), "brakes": brakes})
+    return plans
+
+
+ALONG_LAT_M = (1.75, 2.5)  # along walkers' distance right of the route centre: their nearest body corner (~0.35 m) stays past the 1.3 m in-path corridor, so the expert passes instead of trailing them (11-02 probe: at 1.4 m they still counted as leads)
+
+
+def path_walker_plan(route: WindowedRoute, rng, n: int, lane_half_m: float = 1.75) -> list[dict]:
+    """Scripted pedestrians in the ego's path (Euro NCAP-like, 11-01: A hit one walking along the lane edge it never
+    saw in its data, where only 0.34% of frames had something within 8 m while moving). Half walk along the right lane
+    edge just outside the in-path corridor (ALONG_LAT_M: the ego passes them close instead of trailing them at walking
+    pace, 11-02 smoke), either way along the road; half cross the road ahead once the ego is within their trigger
+    distance. Positions are route s and lateral offset (left +); the env turns them into CARLA actors."""
+    plans = []
+    for k in range(n):
+        s = rng.uniform(40.0, max(41.0, route.length - 30.0))
+        h = route.heading_at(s)
+        if k % 2 == 0:
+            # ponytail: a straight walk from s; on a curve the walker can drift into the lane (the ego then treats it as a lead)
+            lat = -rng.uniform(*ALONG_LAT_M)
+            back = rng.random() < 0.5
+            plans.append({"mode": "along", "s": s, "lat": lat, "speed": rng.uniform(0.8, 1.5), "heading": h + (math.pi if back else 0.0), "trigger_m": math.inf})
+        else:
+            side = rng.choice((-1.0, 1.0))
+            plans.append({"mode": "cross", "s": s, "lat": side * (lane_half_m + 2.5), "speed": rng.uniform(1.0, 1.8),
+                          "heading": h + side * math.pi / 2.0 * -1.0, "trigger_m": rng.uniform(25.0, 40.0)})
+    return plans

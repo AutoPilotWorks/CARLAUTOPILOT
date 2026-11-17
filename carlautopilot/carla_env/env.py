@@ -11,7 +11,19 @@ from pathlib import Path
 import carla
 import numpy as np
 
-from carlautopilot.carla_env.route import LANE_CHANGE_OPTIONS, WindowedRoute, carla_to_xy, carla_yaw_to_rad, commands_from_options, dedupe_points, junction_turn_options
+from carlautopilot.carla_env.route import (
+    LANE_CHANGE_OPTIONS,
+    WindowedRoute,
+    carla_to_xy,
+    carla_yaw_to_rad,
+    commands_from_options,
+    dedupe_points,
+    junction_turn_options,
+    lead_brake_plan,
+    path_walker_plan,
+    radar_local,
+    radar_obstacle_mask,
+)
 from carlautopilot.core import Action, Command, Event, EventKind, GroundTruth, LeadInfo, Observation, StepResult
 from carlautopilot.scenario import RouteCommand, ScenarioSpec, Waypoint
 from carlautopilot.sim.fake_env import (
@@ -42,6 +54,10 @@ FRONT_CAMERA = (1.5, 0.0, 1.6)  # x, y, z m in the vehicle frame
 # (x, y, z, yaw, pitch, fov) in the vehicle frame (CARLA, y right): 150 deg at the mirrors halves the ground blind area
 # within 2 m of the body vs 120 deg (8.1 vs 16.8 m2 at pitch -20/-25).
 MULTICAM_SCALE = 4
+VIEW_SCALE = 2  # recovery views need no light crop: 2x + box-downscale renders 1/4 of 4x's pixels (4x: collection 2.6x slower, 11-02)
+# front radar in the bumper like a production ACC/AEB radar: x, z m in the vehicle frame, horizontal/vertical fov deg,
+# range m, points per second
+RADAR = (2.3, 0.6, 30.0, 10.0, 50.0, 3000)
 LIGHT_CROP_DEG = (50.0, 18.0, 8.0)  # width, above and below the horizon: the truck light camera's view (50 deg, up 5)
 SURROUND_CAMERAS = {
     "left": (0.6, -1.05, 1.1, -90.0, -20.0, 150.0),
@@ -67,6 +83,9 @@ def light_crop(img: np.ndarray, fov_deg: float, crop: tuple[float, float, float]
 ROUTE_END_MARGIN_M = 2.0
 BLOCKED_SECONDS = 90.0  # CARLA reds at 4-way junctions can exceed 30 s
 CORRIDOR_HALF_M = 1.8
+LEAD_BODY_HALF_M = 1.3  # a body corner this close to the route centre line is in our path (sedan half width ~1.0)
+WALKER_HALT_M = 4.0  # scripted walkers stop while the ego centre is this close ahead on their line (sedan half length ~2.4)
+WALKER_HALT_SIDE_M = 1.2  # ... and this close to their line (sedan half width ~1.0 + walker)
 LIGHT_MATCH_M = 2.0
 SETTLE_TICKS = 20
 WEATHERS = ("ClearNoon", "CloudyNoon", "WetNoon", "ClearSunset", "CloudySunset")
@@ -117,6 +136,11 @@ class CarlaEnv:
         follow_spectator: bool = True,
         fov: float = 120.0,
         junction_rules: bool = False,
+        radar: bool = False,
+        extra_views: tuple[tuple[float, float], ...] = (),
+        walker_cross: float = WALKER_CROSS_FACTOR,
+        path_walkers: int = 0,
+        lead_brakes: int = 0,
     ):
         """The sedan camera rig (see SURROUND_CAMERAS): one fixed front camera (fov deg) rendered at MULTICAM_SCALE x
         image_size gives obs.image (downscaled) and extras["light_image"] (light_crop), and extras["surround_images"]
@@ -125,7 +149,29 @@ class CarlaEnv:
         junction_rules: stop signs on the route must be served (halt in STOP_SIGN_ZONE_M for STOP_SIGN_HOLD_S, else a
         STOP_SIGN event), and privileged extras gain next_stop_sign_distance_m and yield_distance_m (junction entry ahead
         while a vehicle/pedestrian is predicted, at constant velocity, to cross the ego's path inside the junction).
+
+        radar: a front RADAR sensor; extras["radar"] holds its raw detections and extras["radar_lead"] the nearest
+        detection above the road and inside the route corridor (a rule: the route is the planner's, not perception).
+
+        extra_views: recovery cameras, (offset left m, yaw left deg) from the front camera, rendered at VIEW_SCALE x and
+        box-downscaled into privileged extras["view_images"] for collection; the expert labels them from that pose.
+        walker_cross: share of pedestrians that cross roads (CARLA's cross factor).
+        path_walkers: scripted pedestrians per episode in the ego's path (route.path_walker_plan), seeded by the scenario.
+        lead_brakes: vehicles put ahead on the ego's route that brake hard now and then (route.lead_brake_plan).
         """
+        self.path_walkers = path_walkers
+        self._path_walkers: list[list] = []  # [actor, plan, started]
+        self.lead_brakes = lead_brakes
+        self._lead_brakes: list[list] = []  # [actor, plan, braking]
+        self.extra_views = tuple(extra_views)
+        self._view_queues: list[queue.Queue] = []
+        self._view_images: list[np.ndarray] = []
+        self.walker_cross = walker_cross
+        self.radar = radar
+        self._radar_queue: queue.Queue | None = None
+        self._radar_points = np.zeros((0, 4), dtype=np.float32)
+        self.radar_ms = 0.0
+        self.lead_type: str | None = None
         self._surround_queues: dict[str, queue.Queue] = {}
         self._surround_images: dict[str, np.ndarray] = {}
         self._light_image: np.ndarray | None = None
@@ -237,6 +283,20 @@ class CarlaEnv:
             self._front_queue = self._camera(bpl, w * MULTICAM_SCALE, h * MULTICAM_SCALE, self.fov, carla.Transform(carla.Location(x=x, y=y, z=z)))
             for name, (x, y, z, yaw, pitch, fov) in SURROUND_CAMERAS.items():
                 self._surround_queues[name] = self._camera(bpl, w, h, fov, carla.Transform(carla.Location(x=x, y=y, z=z), carla.Rotation(pitch=pitch, yaw=yaw)))
+            x, y, z = FRONT_CAMERA
+            # CARLA y is right and yaw clockwise, the views are given left-positive
+            self._view_queues = [self._camera(bpl, w * VIEW_SCALE, h * VIEW_SCALE, self.fov, carla.Transform(carla.Location(x=x, y=y - dy, z=z), carla.Rotation(yaw=-dyaw)))
+                                 for dy, dyaw in self.extra_views]
+        self._radar_queue = None
+        if self.radar:
+            x, z, hfov, vfov, rng_m, pps = RADAR
+            bp = bpl.find("sensor.other.radar")
+            for k, v in (("horizontal_fov", hfov), ("vertical_fov", vfov), ("range", rng_m), ("points_per_second", pps)):
+                bp.set_attribute(k, str(v))
+            self._radar_actor = self.world.spawn_actor(bp, carla.Transform(carla.Location(x=x, z=z)), attach_to=self._ego)
+            self._radar_queue = queue.Queue()
+            self._radar_actor.listen(self._radar_queue.put)
+            self._actors.append(self._radar_actor)
         self._collisions: list = []
         col = self.world.spawn_actor(bpl.find("sensor.other.collision"), carla.Transform(), attach_to=self._ego)
         col.listen(self._collisions.append)
@@ -247,6 +307,8 @@ class CarlaEnv:
 
         self._scenario = scenario
         self._route = WindowedRoute([(w.x, w.y) for w in scenario.route])
+        self._spawn_path_walkers(random.Random(seed + 2))
+        self._spawn_lead_brakes(random.Random(seed + 3))
         self._lights = self._lights_on_route()
         self._stop_signs = self._stop_signs_on_route() if self.junction_rules else []
         self._stop_served: set[int] = set()
@@ -277,13 +339,85 @@ class CarlaEnv:
                 npc.set_autopilot(True, self.tm_port)
                 self._npcs.append(npc.id)
 
+    def _spawn_path_walkers(self, rng: random.Random) -> None:
+        self._path_walkers = []
+        if self.path_walkers <= 0:
+            return
+        bps = list(self.world.get_blueprint_library().filter("walker.pedestrian.*"))
+        cmap = self.world.get_map()
+        for plan in path_walker_plan(self._route, rng, self.path_walkers):
+            px, py = self._route.point_at(plan["s"])
+            h = self._route.heading_at(plan["s"])
+            px, py = px - math.sin(h) * plan["lat"], py + math.cos(h) * plan["lat"]
+            cx, cy = px, -py  # project -> CARLA
+            z = cmap.get_waypoint(carla.Location(x=cx, y=cy), project_to_road=True).transform.location.z
+            bp = rng.choice(bps)
+            if bp.has_attribute("is_invincible"):
+                bp.set_attribute("is_invincible", "false")
+            w = self.world.try_spawn_actor(bp, carla.Transform(carla.Location(x=cx, y=cy, z=z + 1.0)))
+            if w is not None:
+                self._actors.append(w)
+                self._path_walkers.append([w, plan, plan["mode"] == "along"])
+
+    def _spawn_lead_brakes(self, rng: random.Random) -> None:
+        """Traffic Manager cars on the ego's own route ahead (set_path, no lane changes, a slower desired speed), so the
+        ego catches up and follows them; _drive_lead_brakes makes them brake to a stop in their planned windows."""
+        self._lead_brakes = []
+        if self.lead_brakes <= 0:
+            return
+        bps = [b for b in self.world.get_blueprint_library().filter("vehicle.*") if int(b.get_attribute("number_of_wheels")) == 4]
+        cmap = self.world.get_map()
+        for plan in lead_brake_plan(self._route, rng, self.lead_brakes):
+            px, py = self._route.point_at(plan["s"])
+            h = self._route.heading_at(plan["s"])
+            wp = cmap.get_waypoint(carla.Location(x=px, y=-py), project_to_road=True)
+            tr = carla.Transform(wp.transform.location + carla.Location(z=0.5), carla.Rotation(yaw=-math.degrees(h)))
+            v = self.world.try_spawn_actor(rng.choice(bps), tr)
+            if v is None:
+                continue
+            self._npcs.append(v.id)  # batch-destroyed like the NPCs: destroy() on a Traffic Manager car crashed the client (11-02 smoke)
+            v.set_autopilot(True, self.tm_port)
+            self.tm.auto_lane_change(v, False)
+            self.tm.set_desired_speed(v, plan["speed_kmh"])
+            path = [carla.Location(x=x, y=-y) for x, y in (self._route.point_at(s) for s in np.arange(plan["s"] + 5.0, self._route.length, 5.0))]
+            if path:
+                self.tm.set_path(v, path)
+            self._lead_brakes.append([v, plan, False])
+
+    def _drive_lead_brakes(self) -> None:
+        for item in self._lead_brakes:
+            v, plan, braking = item
+            now = any(t0 <= self.t < t0 + d for t0, d in plan["brakes"])
+            if now != braking:
+                v.set_autopilot(not now, self.tm_port)
+                item[2] = now
+            if now:
+                v.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0))
+
+    def _drive_path_walkers(self) -> None:
+        """Scripted walkers keep their line but halt while the ego body is on that line just ahead of them, so they never
+        walk into a standing car (11-01 smoke). Only on their line: a walker halting for a car beside its line (e.g.
+        mid-crossing in front of it) deadlocked with the ego waiting for it (11-02 radar probe, 3 of 4 blocked)."""
+        ego = self._ego.get_location()
+        for item in self._path_walkers:
+            w, plan, started = item
+            if not started and plan["s"] - self._s <= plan["trigger_m"]:
+                item[2] = started = True
+            if started:
+                hp = plan["heading"]
+                dx, dy = math.cos(hp), -math.sin(hp)  # CARLA frame
+                loc = w.get_location()
+                ex, ey = ego.x - loc.x, ego.y - loc.y
+                blocked = 0.0 < ex * dx + ey * dy < WALKER_HALT_M and abs(ex * dy - ey * dx) < WALKER_HALT_SIDE_M
+                w.apply_control(carla.WalkerControl(direction=carla.Vector3D(dx, dy, 0.0), speed=0.0 if blocked else plan["speed"]))
+
     def _spawn_walkers(self, seed: int, n: int, ego_loc) -> None:
         if n <= 0:
             return
         bpl = self.world.get_blueprint_library()
         rng = random.Random(seed + 1)
         self.world.set_pedestrians_seed(seed)
-        self.world.set_pedestrians_cross_factor(WALKER_CROSS_FACTOR)
+        self.world.set_pedestrians_cross_factor(self.walker_cross)
         walkers = []
         for _ in range(n * 2):
             if len(walkers) >= n:
@@ -414,11 +548,15 @@ class CarlaEnv:
         return q
 
     @staticmethod
-    def _read(q: queue.Queue, frame: int) -> np.ndarray:
+    def _wait(q: queue.Queue, frame: int):
         while True:
-            img = q.get(timeout=10.0)
-            if img.frame >= frame:
-                break
+            m = q.get(timeout=10.0)
+            if m.frame >= frame:
+                return m
+
+    @classmethod
+    def _read(cls, q: queue.Queue, frame: int) -> np.ndarray:
+        img = cls._wait(q, frame)
         a = np.frombuffer(img.raw_data, dtype=np.uint8).reshape(img.height, img.width, 4)
         return np.ascontiguousarray(a[:, :, 2::-1])
 
@@ -429,6 +567,29 @@ class CarlaEnv:
             self._light_image = light_crop(front, self.fov)
             self._last_image = box_downscale(front, MULTICAM_SCALE)
         self._surround_images = {n: self._read(q, frame) for n, q in self._surround_queues.items()}
+        self._view_images = [box_downscale(self._read(q, frame), VIEW_SCALE) for q in self._view_queues]
+        if self._radar_queue is not None:
+            m = self._wait(self._radar_queue, frame)
+            self._radar_points = np.frombuffer(m.raw_data, dtype=np.float32).reshape(-1, 4).copy()
+
+    def _radar_lead(self) -> LeadInfo | None:
+        """Nearest radar detection above the road inside the route corridor ahead; closing speed from its Doppler
+        velocity (radial only: a pedestrian crossing straight across reads ~0)."""
+        t0 = time.perf_counter()
+        pts = self._radar_points
+        local = radar_local(pts)
+        keep = radar_obstacle_mask(local, RADAR[1])
+        best = None
+        if keep.any():
+            m = np.array(self._radar_actor.get_transform().get_matrix())
+            world = (m[:3, :3] @ local[keep].T).T + m[:3, 3]
+            ego_half = self._ego.bounding_box.extent.x
+            for (wx, wy, _), vel in zip(world, pts[keep, 0]):
+                s, lat, _ = self._route.project(*carla_to_xy(wx, wy), self._s, self._s + LEAD_VISIBLE_M)
+                if s > self._s and abs(lat) < LEAD_BODY_HALF_M and (best is None or s - self._s - ego_half < best.distance_m):
+                    best = LeadInfo(distance_m=max(s - self._s - ego_half, 0.0), rel_speed_mps=float(vel))
+        self.radar_ms = (time.perf_counter() - t0) * 1000.0
+        return best
 
     def _follow(self, tr) -> None:
         back = tr.get_forward_vector()
@@ -463,10 +624,11 @@ class CarlaEnv:
             ox, oy = carla_to_xy(loc.x, loc.y)
             if math.hypot(ox - self.x, oy - self.y) > LEAD_VISIBLE_M + 10.0:
                 continue
-            s, lat, _ = self._route.project(ox, oy, self._s, self._s + LEAD_VISIBLE_M)
-            if abs(lat) > CORRIDOR_HALF_M or s <= self._s:
+            corners = [carla_to_xy(v.x, v.y) for v in a.bounding_box.get_world_vertices(a.get_transform())]
+            s = self._route.body_ahead(corners, self._s, self._s + LEAD_VISIBLE_M, LEAD_BODY_HALF_M)
+            if s is None:
                 continue
-            gap = s - self._s - ego_half - a.bounding_box.extent.x
+            gap = s - self._s - ego_half
             if gap > LEAD_VISIBLE_M:
                 continue
             h = self._route.heading_at(s)
@@ -475,6 +637,9 @@ class CarlaEnv:
             along = vx * math.cos(h) + vy * math.sin(h)
             if best is None or gap < best.distance_m:
                 best = LeadInfo(distance_m=max(gap, 0.0), rel_speed_mps=along - self.v)
+                self.lead_type = a.type_id
+        if best is None:
+            self.lead_type = None
         return best
 
     def _extras(self) -> dict:
@@ -490,6 +655,7 @@ class CarlaEnv:
             "heading_error_rad": _wrap(self.yaw - self._route.heading_at(self._s)),
             "lateral_error_m": self._lat,
             "lookahead_points": pts,
+            "view_images": self._view_images,
         }
         for ls, light in self._lights:
             dist = ls - self._s
@@ -516,6 +682,9 @@ class CarlaEnv:
         if self.render_images:
             extras["light_image"] = self._light_image
             extras["surround_images"] = self._surround_images
+        if self.radar:
+            extras["radar"] = self._radar_points
+            extras["radar_lead"] = self._radar_lead()
         return Observation(t=self.t, speed_mps=self.v, command=self._command(), image=image, lead=self._lead_info(), extras=extras)
 
     def ground_truth(self) -> GroundTruth:
@@ -531,6 +700,8 @@ class CarlaEnv:
         a = action.clipped()
         self._ego.apply_control(carla.VehicleControl(throttle=a.throttle, steer=a.steer, brake=a.brake))
         prev_s = self._s
+        self._drive_path_walkers()
+        self._drive_lead_brakes()
         self._tick()
         self.t += self.dt
         self._update_pose()

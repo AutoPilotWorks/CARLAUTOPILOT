@@ -13,7 +13,7 @@ STOP_KEYS = ("red", "red_dist", "sign_dist", "yield", "yield_dist")
 PERCEPT_KEYS = STOP_KEYS + ("lead_dist", "lead_rel")  # RouteSteeringNet(perceive=True) outputs 4.. in this order
 # light_idx: row -> time-step index into the per-step camera folders: light/ always, plus the sedan's surround cameras
 # left/ right/ rear/ when it has them
-OPTIONAL_KEYS = ("target_speed",) + PERCEPT_KEYS + ("light_idx",)
+OPTIONAL_KEYS = ("target_speed",) + PERCEPT_KEYS + ("light_idx", "view")  # view: 0 front camera, k = k-th recovery view
 STEP_FOLDERS = ("light", "left", "right", "rear")
 SURROUND_FOLDERS = STEP_FOLDERS[1:]  # the order RouteSteeringNet(surround=True) takes them in
 META_KEYS = ("scenario_name", "seed", "dt", "image_height", "image_width")
