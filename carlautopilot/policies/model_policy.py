@@ -6,10 +6,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from carlautopilot.control import ACCController, SafetyConfig, apply_safety
+from carlautopilot.control import ACCController, PurePursuit, SafetyConfig, apply_safety
 from carlautopilot.core import Action, LeadInfo, Observation
 from carlautopilot.data.episode_store import SURROUND_FOLDERS
-from carlautopilot.models.route_steering import PERCEPT_RANGE_M, RouteSteeringNet
+from carlautopilot.models.route_steering import N_WAYPOINTS, PERCEPT_RANGE_M, RouteSteeringNet
 from carlautopilot.policies.pathfollow import stop_accel
 from carlautopilot.sim.fake_env import BLOCKED_SPEED_MPS, STOP_SIGN_HOLD_S, STOP_SIGN_ZONE_M
 
@@ -35,6 +35,12 @@ class ModelPolicy:
     safety: SafetyConfig = field(default_factory=SafetyConfig)
     device: str = "cpu"
     name: str = "model"
+    # a waypoints model steers by pure pursuit on its predicted path (a rule, the expert's controller and look-ahead)
+    wheelbase_m: float = 3.0
+    max_steer_rad: float = 0.5
+    lookahead_gain: float = 0.5
+    lookahead_offset_m: float = 2.0
+    lookahead_min_m: float = 3.0
 
     def __post_init__(self) -> None:
         self.model.to(self.device).eval()
@@ -45,7 +51,7 @@ class ModelPolicy:
         cfg = ckpt.get("cfg", {})
         model = RouteSteeringNet(backbone=cfg.get("backbone", "small"), pretrained=False, predict_speed=cfg.get("predict_speed", False),
                                  perceive=cfg.get("perceive", False), light_camera=cfg.get("light_camera", False),
-                                 surround=cfg.get("surround", False))
+                                 surround=cfg.get("surround", False), waypoints=cfg.get("waypoints", False))
         model.load_state_dict(ckpt["model_state"])
         return cls(model, **kw)
 
@@ -72,8 +78,17 @@ class ModelPolicy:
                 raise ValueError("this model needs extras['surround_images'] (the CARLA env's left/right/rear cameras)")
             # uint8 like the training loader: the model scales it to [0, 1] itself
             surround = torch.from_numpy(np.stack([views[f] for f in SURROUND_FOLDERS]).astype(np.uint8)).permute(0, 3, 1, 2).unsqueeze(0).to(self.device)
-        out = self.model(image, speed, command, light, surround)[0].cpu().numpy()
+        target_point = None
+        if self.model.waypoints:
+            if obs.extras.get("route_target") is None:
+                raise ValueError("this model needs extras['route_target'] (the navigation target point)")
+            target_point = torch.tensor([obs.extras["route_target"]], dtype=torch.float32, device=self.device)
+        out = self.model(image, speed, command, light, surround, target_point)[0].cpu().numpy()
         steer = float(out[0])
+        if self.model.waypoints:
+            self.last_waypoints = [(float(x), float(y)) for x, y in out[-2 * N_WAYPOINTS:].reshape(-1, 2)]
+            lookahead = min(20.0, max(self.lookahead_min_m, self.lookahead_gain * obs.speed_mps + self.lookahead_offset_m))
+            steer = PurePursuit(self.wheelbase_m, lookahead, self.max_steer_rad).steer(self.last_waypoints)
         if not hasattr(self, "_sign_served"):
             self.reset()
         dt = 0.0 if self._last_t is None else max(obs.t - self._last_t, 0.0)

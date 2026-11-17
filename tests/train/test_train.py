@@ -1,11 +1,31 @@
 import json
 
+import numpy as np
 import pytest
 import torch
 
 from carlautopilot.models.route_steering import RouteSteeringNet
 from carlautopilot.train.train_steering import TrainConfig, main, train
 from tests.helpers import make_episodes
+
+
+def test_waypoint_model_learns_the_path_per_command_and_the_policy_follows_it(tmp_path):
+    from carlautopilot.core import Command, Observation
+    from carlautopilot.policies.model_policy import ModelPolicy
+
+    ids = make_episodes(tmp_path / "data", n_episodes=4, steps=40, waypoints=True)
+    res = train(cfg(tmp_path, ids, epochs=12, waypoints=True))
+    assert res["history"][-1]["train_loss"] < res["history"][0]["train_loss"] * 0.5
+    pol = ModelPolicy.from_checkpoint(tmp_path / "out" / "checkpoint.pt")
+    img = np.zeros((32, 64, 3), dtype=np.uint8)
+    steers = {}
+    for c in (Command.LEFT, Command.RIGHT):
+        pol.reset()
+        steers[c] = pol.act(Observation(t=0.0, speed_mps=5.0, command=c, image=img, extras={"route_target": (30.0, 0.0)})).steer
+        assert len(pol.last_waypoints) == 8
+    assert steers[Command.LEFT] < -0.05 and steers[Command.RIGHT] > 0.05  # positive steer is right
+    with pytest.raises(ValueError, match="route_target"):
+        pol.act(Observation(t=0.0, speed_mps=5.0, command=Command.LEFT, image=img))
 
 
 def cfg(tmp_path, ids, epochs=2, **kw):

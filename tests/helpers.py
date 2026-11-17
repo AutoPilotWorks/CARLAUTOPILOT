@@ -6,7 +6,11 @@ from carlautopilot.data.episode_store import write_episode
 STEER_BY_COMMAND = {Command.FOLLOW: 0.0, Command.LEFT: -0.5, Command.RIGHT: 0.5, Command.STRAIGHT: 0.0}
 
 
-def make_episodes(root, n_episodes=4, steps=20, h=32, w=64, seed=0, target_speed=False, perception=False, light=False, surround=False):
+LOOK_X = np.array([3.0, 6.0, 9.0, 12.0, 15.0, 20.0, 25.0, 30.0])
+
+
+def make_episodes(root, n_episodes=4, steps=20, h=32, w=64, seed=0, target_speed=False, perception=False, light=False, surround=False,
+                  waypoints=False):
     rng = np.random.default_rng(seed)
     ids = []
     for e in range(n_episodes):
@@ -31,6 +35,9 @@ def make_episodes(root, n_episodes=4, steps=20, h=32, w=64, seed=0, target_speed
             arrays["sign_dist"] = rng.choice([8.0, 40.0], size=steps).astype(np.float32)
             arrays["yield"] = (rng.random(steps) < 0.2).astype(np.float32)
             arrays["yield_dist"] = np.where(arrays["yield"] > 0, 10.0, 40.0).astype(np.float32)
+        if waypoints:  # route bending left (y > 0) for LEFT, right for RIGHT, straight otherwise
+            bend = -2.0 * steer[:, None] * (LOOK_X / 30.0) ** 2 * 10.0
+            arrays["route_pts"] = np.stack([np.broadcast_to(LOOK_X, bend.shape), bend], axis=2).astype(np.float32)
         images = rng.integers(0, 256, size=(steps, h, w, 3), dtype=np.uint8)
         light_images = None
         if light:

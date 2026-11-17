@@ -9,6 +9,7 @@ NUM_COMMANDS = len(Command)
 # perception labels are capped here; a lead/light distance at the cap means 'none in range'
 PERCEPT_RANGE_M = 40.0  # a red light 50 m out is often still hidden (crests, small at 160x320); stopping from 29 km/h needs ~20 m
 N_PERCEPT = 7  # perception outputs, in episode_store.PERCEPT_KEYS order
+N_WAYPOINTS = 8  # path points at fake_env.LOOKAHEAD_OFFSETS_M (3..30 m along the route), x forward / y left m
 
 
 def _resnet18(feature_dim: int, pretrained: bool) -> nn.Module:
@@ -86,10 +87,14 @@ class RouteSteeringNet(nn.Module):
     surround adds the sedan's left/right/rear camera images (B, 3, 3, H, W) in SURROUND_FOLDERS order: one encoder shared
     by the three (its own weights, not the front backbone's: they look down and sideways), features concatenated in that
     fixed order next to the front features, so the driving heads and the perception head (except P(red)) see all of them.
+    waypoints adds the navigation target point (route 30 m ahead, vehicle frame, B x 2) as an input and N_WAYPOINTS path
+    points as the last 2 * N_WAYPOINTS output columns (x0, y0, x1, ...), one head per command like the driving heads; a
+    controller then follows the points (LBC/TCP-style). Steering regressed directly never saw a way back to the lane and
+    turned late into junctions: 22 of v2.1 A's 28 failures began with leaving the lane (11-17).
     """
 
     def __init__(self, feature_dim: int = 128, backbone: str = "small", pretrained: bool = True, predict_speed: bool = False,
-                 perceive: bool = False, light_camera: bool = False, surround: bool = False):
+                 perceive: bool = False, light_camera: bool = False, surround: bool = False, waypoints: bool = False):
         super().__init__()
         if perceive and not predict_speed:
             raise ValueError("perceive needs predict_speed")
@@ -98,7 +103,8 @@ class RouteSteeringNet(nn.Module):
         self.predict_speed = predict_speed
         self.perceive = perceive
         self.light_camera = light_camera
-        self.n_out = 4 + N_PERCEPT if perceive else 4 if predict_speed else 3
+        self.waypoints = waypoints
+        self.n_out = (4 + N_PERCEPT if perceive else 4 if predict_speed else 3) + (2 * N_WAYPOINTS if waypoints else 0)
         head_out = 4 if predict_speed else 3
         self.backbone = _backbone(backbone, feature_dim, pretrained)
         self.surround = surround
@@ -106,7 +112,12 @@ class RouteSteeringNet(nn.Module):
             self.surround_net = _backbone(backbone, feature_dim, pretrained)
         img_dim = feature_dim * (4 if surround else 1)
         self.speed = nn.Sequential(nn.Linear(1, 16), nn.ReLU())
-        self.merge = nn.Sequential(nn.Linear(img_dim + 16, feature_dim), nn.ReLU())
+        if waypoints:
+            self.target = nn.Sequential(nn.Linear(2, 16), nn.ReLU())
+            self.wp_heads = nn.ModuleList(
+                nn.Sequential(nn.Linear(feature_dim, 64), nn.ReLU(), nn.Linear(64, 2 * N_WAYPOINTS)) for _ in range(NUM_COMMANDS)
+            )
+        self.merge = nn.Sequential(nn.Linear(img_dim + 16 + (16 if waypoints else 0), feature_dim), nn.ReLU())
         self.heads = nn.ModuleList(
             nn.Sequential(nn.Linear(feature_dim, 64), nn.ReLU(), nn.Linear(64, head_out)) for _ in range(NUM_COMMANDS)
         )
@@ -118,17 +129,25 @@ class RouteSteeringNet(nn.Module):
             self.light_red = nn.Linear(64, 1)
 
     def forward(self, image: torch.Tensor, speed: torch.Tensor, command: torch.Tensor, light: torch.Tensor | None = None,
-                surround: torch.Tensor | None = None) -> torch.Tensor:
+                surround: torch.Tensor | None = None, target_point: torch.Tensor | None = None) -> torch.Tensor:
         image, light, surround = _to_unit(image), _to_unit(light), _to_unit(surround)
         img = self.backbone(image)
         if self.surround:
             if surround is None:
                 raise ValueError("this model needs the surround camera images")
             img = torch.cat([img, self.surround_net(surround.flatten(0, 1)).view(len(img), -1)], dim=1)
-        feat = self.merge(torch.cat([img, self.speed(speed.view(-1, 1))], dim=1))
-        all_out = torch.stack([head(feat) for head in self.heads], dim=1)
-        idx = command.long().view(-1, 1, 1).expand(-1, 1, all_out.shape[2])
-        raw = all_out.gather(1, idx).squeeze(1)
+        parts = [img, self.speed(speed.view(-1, 1))]
+        if self.waypoints:
+            if target_point is None:
+                raise ValueError("this model needs the navigation target point")
+            parts.append(self.target(target_point.view(-1, 2) / 30.0))  # metres, ~unit scale
+        feat = self.merge(torch.cat(parts, dim=1))
+
+        def by_command(heads):
+            out = torch.stack([head(feat) for head in heads], dim=1)
+            return out.gather(1, command.long().view(-1, 1, 1).expand(-1, 1, out.shape[2])).squeeze(1)
+
+        raw = by_command(self.heads)
         if self.perceive:
             if self.light_camera:
                 if light is None:
@@ -145,4 +164,6 @@ class RouteSteeringNet(nn.Module):
         if self.perceive:
             out += [torch.sigmoid(raw[:, 4:5]), nn.functional.softplus(raw[:, 5:7]), torch.sigmoid(raw[:, 7:8]),
                     nn.functional.softplus(raw[:, 8:10]), raw[:, 10:11]]
+        if self.waypoints:
+            out.append(by_command(self.wp_heads))
         return torch.cat(out, dim=1)

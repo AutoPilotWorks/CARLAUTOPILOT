@@ -20,6 +20,8 @@ from carlautopilot.policies import PathFollowPolicy
 from carlautopilot.scenario import ScenarioSpec
 
 ACC = ACCController(IDM(s0=4.0))  # gaps are measured along the route, so keep a larger standstill margin
+# a waypoints model follows its predicted path with the expert's pure pursuit (car geometry and look-ahead)
+MODEL_STEER = dict(wheelbase_m=WHEELBASE_M, max_steer_rad=MAX_STEER_RAD, lookahead_gain=0.5, lookahead_offset_m=2.0, lookahead_min_m=3.0)
 
 
 def make_scenarios(env: CarlaEnv, a: argparse.Namespace) -> list[ScenarioSpec]:
@@ -51,7 +53,7 @@ def collect(a: argparse.Namespace, env: CarlaEnv) -> None:
     if a.dagger:
         from carlautopilot.policies.model_policy import ModelPolicy
 
-        driver = ModelPolicy.from_checkpoint(a.dagger, acc=ACC, device="cuda")  # only its steering is used
+        driver = ModelPolicy.from_checkpoint(a.dagger, acc=ACC, device="cuda", **MODEL_STEER)  # only its steering is used
     for sc in make_scenarios(env, a):
         eid = sc.name
         if (root / eid).exists():
@@ -84,7 +86,7 @@ def evaluate(a: argparse.Namespace, env: CarlaEnv) -> None:
     else:
         from carlautopilot.policies.model_policy import ModelPolicy
 
-        factory = lambda: ModelPolicy.from_checkpoint(a.checkpoint, speed_limit_mps=a.model_speed, acc=ACC, device=a.device)
+        factory = lambda: ModelPolicy.from_checkpoint(a.checkpoint, speed_limit_mps=a.model_speed, acc=ACC, device=a.device, **MODEL_STEER)
         title = f"CARLA {a.town}: model"
     view = None
     if a.view:

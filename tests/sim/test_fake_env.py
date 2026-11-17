@@ -170,7 +170,7 @@ def test_command_follows_progress():
 
 def test_privileged_obs():
     sc = straight(200.0, lights=(TrafficLightSpec(60.0, red_s=100.0, green_s=1.0),), meta={"initial_speed_mps": 5.0})
-    assert FakeEnv().reset(sc).extras == {}
+    assert FakeEnv().reset(sc).extras == {"route_target": (30.0, 0.0)}  # navigation only: the route 30 m ahead
     env = FakeEnv(privileged_obs=True)
     obs = env.reset(sc)
     ex = obs.extras

@@ -28,10 +28,11 @@ def build_image_cache(root: str | Path, episode_id: str, cache_dir: str | Path, 
 
 class EpisodeDataset(Dataset):
     def __init__(self, root: str | Path, episode_ids: list[str], cache_dir: str | Path | None = None, target_speed: bool = False, perception: bool = False, light: bool = False,
-                 surround: bool = False):
+                 surround: bool = False, waypoints: bool = False):
         """target_speed appends the expert's road-geometry speed label as a 4th target column; perception (with it)
         appends PERCEPT_KEYS as columns 5-11. surround adds item["surround"]: the step's SURROUND_FOLDERS images
-        stacked (3, 3, H, W) uint8."""
+        stacked (3, 3, H, W) uint8. waypoints appends the row's route_pts flattened (x0, y0, x1, ...) as the last target
+        columns and adds item["target_point"]: the farthest of them (30 m), the navigation target the model is given."""
         if not episode_ids:
             raise ValueError("episode_ids is empty")
         self.root = Path(root)
@@ -40,6 +41,7 @@ class EpisodeDataset(Dataset):
         self.percept_keys = PERCEPT_KEYS
         self.light = light
         self.surround = surround
+        self.waypoints = waypoints
         self._step_folders = (("light",) if light else ()) + (SURROUND_FOLDERS if surround else ())
         self._step_cache: dict[str, Path] = {}  # "<episode>/<folder>" -> cache file
         self._cache: dict[str, Path] = {}
@@ -52,6 +54,8 @@ class EpisodeDataset(Dataset):
                 raise ValueError(f"{eid} has no target_speed labels")
             if perception and any(k not in arrays for k in self.percept_keys):
                 raise ValueError(f"{eid} has no perception labels")
+            if waypoints and "route_pts" not in arrays:
+                raise ValueError(f"{eid} has no route_pts (collected before 2026-11-17)")
             if light and "light_idx" not in arrays:
                 raise ValueError(f"{eid} has no traffic-light camera images")
             if surround and ("light_idx" not in arrays or not (self.root / eid / SURROUND_FOLDERS[0]).is_dir()):
@@ -88,6 +92,10 @@ class EpisodeDataset(Dataset):
         cols += [a[k][i] for k in self.percept_keys] if self.perception else []
         target = np.array(cols, dtype=np.float32)
         item = {}
+        if self.waypoints:
+            pts = np.asarray(a["route_pts"][i], dtype=np.float32)
+            target = np.concatenate([target, pts.reshape(-1)])
+            item["target_point"] = torch.from_numpy(pts[-1].copy())
         if self._step_folders:
             j = int(a["light_idx"][i])
             step = {f: torch.from_numpy(self._step_image(eid, f, j)).permute(2, 0, 1) for f in self._step_folders}

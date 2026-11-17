@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader, WeightedRandomSampler
 from carlautopilot.data.episode_dataset import EpisodeDataset
 from carlautopilot.data.episode_store import list_episodes
 from carlautopilot.data.splits import make_folds
-from carlautopilot.models.route_steering import PERCEPT_RANGE_M, RouteSteeringNet
+from carlautopilot.models.route_steering import N_WAYPOINTS, PERCEPT_RANGE_M, RouteSteeringNet
 from carlautopilot.sim.fake_env import STOP_SIGN_ZONE_M
 
 
@@ -45,6 +45,8 @@ class TrainConfig:
     boost_yield: float = 1.0
     cosine: bool = False
     loss_weights: list[float] = field(default_factory=lambda: [1.0, 0.5, 0.5])
+    waypoints: bool = False
+    waypoint_weight: float = 1.0  # times the mean |error| in metres over the path points' coordinates
 
 
 CURVE_SLOW_MPS = 6.0
@@ -125,7 +127,7 @@ def excluded_rows(root: str | Path, index: list[tuple[str, int]]) -> np.ndarray:
     return np.array([any(a <= i <= b for a, b in spans.get(eid, ())) for eid, i in index], dtype=bool)
 
 
-def _run_epoch(model, loader, device, w, optimizer=None, scaler=None) -> float:
+def _run_epoch(model, loader, device, w, optimizer=None, scaler=None, wp_weight: float = 1.0) -> float:
     train = optimizer is not None
     model.train(train)
     # summed on the device in float64 (the same sum the old per-batch loss.item() made in Python): .item() every batch
@@ -134,9 +136,13 @@ def _run_epoch(model, loader, device, w, optimizer=None, scaler=None) -> float:
     with torch.set_grad_enabled(train):
         for batch in loader:
             image, speed, command, target = (batch[k].to(device, non_blocking=True) for k in ("image", "speed", "command", "target"))
-            light, surround = (batch[k].to(device, non_blocking=True) if k in batch else None for k in ("light", "surround"))
+            light, surround, tp = (batch[k].to(device, non_blocking=True) if k in batch else None for k in ("light", "surround", "target_point"))
             with torch.autocast(device.type, enabled=scaler is not None):
-                loss = _weighted_l1(model(image, speed, command, light, surround).float(), target, w)
+                pred = model(image, speed, command, light, surround, tp).float()
+                nb = pred.shape[1] - (2 * N_WAYPOINTS if model.waypoints else 0)
+                loss = _weighted_l1(pred[:, :nb], target[:, :nb], w)
+                if model.waypoints:
+                    loss = loss + wp_weight * (pred[:, nb:] - target[:, nb:]).abs().mean(dim=1).mean()
             if train:
                 optimizer.zero_grad()
                 if scaler is None:
@@ -168,8 +174,8 @@ def train(cfg: TrainConfig) -> dict:
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
 
-    train_set = EpisodeDataset(cfg.data_root, cfg.train_ids, cfg.cache_dir, cfg.predict_speed, cfg.perceive, cfg.light_camera, cfg.surround)
-    val_set = EpisodeDataset(cfg.data_root, cfg.val_ids, cfg.cache_dir, cfg.predict_speed, cfg.perceive, cfg.light_camera, cfg.surround)
+    train_set = EpisodeDataset(cfg.data_root, cfg.train_ids, cfg.cache_dir, cfg.predict_speed, cfg.perceive, cfg.light_camera, cfg.surround, cfg.waypoints)
+    val_set = EpisodeDataset(cfg.data_root, cfg.val_ids, cfg.cache_dir, cfg.predict_speed, cfg.perceive, cfg.light_camera, cfg.surround, cfg.waypoints)
     gen = torch.Generator().manual_seed(cfg.seed)
     # pinned batches copy to the GPU without blocking; persistent workers skip re-spawning (and re-opening every cache
     # memmap) at each epoch, which is slow on Windows
@@ -199,7 +205,7 @@ def train(cfg: TrainConfig) -> dict:
     val_loader = DataLoader(val_set, batch_size=cfg.batch_size, shuffle=False, **loader_kw)
 
     model = RouteSteeringNet(backbone=cfg.backbone, predict_speed=cfg.predict_speed, perceive=cfg.perceive,
-                             light_camera=cfg.light_camera, surround=cfg.surround).to(device)
+                             light_camera=cfg.light_camera, surround=cfg.surround, waypoints=cfg.waypoints).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=cfg.lr)
     scaler = torch.amp.GradScaler("cuda") if cfg.amp and device.type == "cuda" else None
     w = torch.tensor(cfg.loss_weights, dtype=torch.float32, device=device)
@@ -218,8 +224,8 @@ def train(cfg: TrainConfig) -> dict:
             # constant lr left v1.11/v1.12 still swinging at the last epoch (Town02 corner steer +0.17 at epoch 7, +0.05 at 8)
             for g in optimizer.param_groups:
                 g["lr"] = cosine_lr(cfg.lr, epoch, cfg.epochs)
-        tr = _run_epoch(model, train_loader, device, w, optimizer, scaler)
-        va = _run_epoch(model, val_loader, device, w, scaler=scaler)
+        tr = _run_epoch(model, train_loader, device, w, optimizer, scaler, cfg.waypoint_weight)
+        va = _run_epoch(model, val_loader, device, w, scaler=scaler, wp_weight=cfg.waypoint_weight)
         history.append({"epoch": epoch, "train_loss": tr, "val_loss": va})
         print(json.dumps(history[-1]), flush=True)
         tmp = out / "last.tmp.pt"
@@ -256,6 +262,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--boost-red-approach", type=float, default=1.0, help="draw frames driving up to a red light (< 30 m) this many times more often; needs perception labels")
     p.add_argument("--boost-yield", type=float, default=1.0, help="draw yield frames this many times more often; needs perception labels")
     p.add_argument("--cosine", action="store_true", help="cosine learning-rate decay over the epochs (per epoch)")
+    p.add_argument("--waypoints", action="store_true", help="also learn the route path points from the image + navigation target (needs route_pts data); a controller follows them")
+    p.add_argument("--waypoint-weight", type=float, default=1.0, help="loss weight of the path points' mean |error| (m)")
     p.add_argument("--balance-commands", action="store_true")
     p.add_argument("--amp", action="store_true", help="mixed precision (CUDA only)")
     p.add_argument("--cache-dir", help="decoded-image cache folder (built on first use; pixels identical to the PNGs)")
@@ -268,7 +276,8 @@ def main(argv: list[str] | None = None) -> None:
     perceive = [1.0, 0.5, 0.5, 0.5, 1.0, 0.05, 0.05, 1.0, 0.05, 0.05, 0.1]
     weights = a.loss_weights or (perceive if a.perceive else [1.0, 0.5, 0.5, 0.5] if a.predict_speed else [1.0, 0.5, 0.5])
     result = train(TrainConfig(a.data_root, train_ids, val_ids, a.out_dir, a.epochs, a.batch_size, a.lr, a.device, a.seed, a.num_workers, loss_weights=weights, backbone=a.backbone, balance_commands=a.balance_commands, amp=a.amp, cache_dir=a.cache_dir, resume=a.resume, predict_speed=a.predict_speed, perceive=a.perceive, balance_curves=a.balance_curves, balance_stops=a.balance_stops, light_camera=a.light_camera, surround=a.surround,
-                                 boost_red_approach=a.boost_red_approach, boost_yield=a.boost_yield, cosine=a.cosine))
+                                 boost_red_approach=a.boost_red_approach, boost_yield=a.boost_yield, cosine=a.cosine,
+                                 waypoints=a.waypoints, waypoint_weight=a.waypoint_weight))
     print(json.dumps(result["history"][-1]))
 
 

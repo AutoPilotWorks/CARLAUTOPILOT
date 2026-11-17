@@ -18,6 +18,16 @@ from carlautopilot.scenario import ScenarioSpec
 from carlautopilot.sim.render import render_view
 
 LOOKAHEAD_OFFSETS_M = (3.0, 6.0, 9.0, 12.0, 15.0, 20.0, 25.0, 30.0)
+NAV_TARGET_M = LOOKAHEAD_OFFSETS_M[-1]
+
+
+def route_target(route, s: float, x: float, y: float, yaw: float) -> tuple[float, float]:
+    """The planned route NAV_TARGET_M ahead in the vehicle frame (x forward, y left): navigation, like the target
+    points a Leaderboard agent gets, so every observation carries it (not a privileged extra)."""
+    px, py = route.point_at(s + NAV_TARGET_M)
+    c, sn = math.cos(-yaw), math.sin(-yaw)
+    dx, dy = px - x, py - y
+    return (dx * c - dy * sn, dx * sn + dy * c)
 LEAD_VISIBLE_M = 100.0
 OFF_ROAD_LATERAL_M = 2.0
 OFF_ROAD_SECONDS = 2.0
@@ -199,7 +209,8 @@ class FakeEnv:
         if self.speed_noise_std > 0:
             speed = max(0.0, speed + float(self._rng.normal(0.0, self.speed_noise_std)))
         image = self._render() if self.render_images else None
-        return Observation(t=self.t, speed_mps=speed, command=self._command(), image=image, lead=self._lead_info(), extras=self._extras())
+        extras = self._extras() | {"route_target": route_target(self._route, self._s, self.x, self.y, self.yaw)}
+        return Observation(t=self.t, speed_mps=speed, command=self._command(), image=image, lead=self._lead_info(), extras=extras)
 
     def _render(self) -> np.ndarray:
         c, s = math.cos(-self.yaw), math.sin(-self.yaw)

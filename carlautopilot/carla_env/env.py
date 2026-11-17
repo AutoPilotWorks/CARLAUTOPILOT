@@ -37,6 +37,7 @@ from carlautopilot.sim.fake_env import (
     STOP_SIGN_HOLD_S,
     STOP_SIGN_ZONE_M,
     _wrap,
+    route_target,
 )
 
 VEHICLE = "vehicle.lincoln.mkz_2020"
@@ -618,6 +619,8 @@ class CarlaEnv:
             m = np.array(actor.get_transform().get_matrix())
             world = (m[:3, :3] @ local[keep].T).T + m[:3, 3]
             s, lat = self._route.project_many(np.stack([world[:, 0], -world[:, 1]], axis=1), self._s, self._s + LEAD_VISIBLE_M)  # CARLA -> project frame
+            # the vehicle corridor: widening it to the pedestrians' 1.5 m barely helped walkers (Town03 only) and let
+            # nearer roadside returns hide the lead car (Town03 vehicle frames 71% -> 42%, 11-18)
             inside = np.nonzero((s > self._s) & (np.abs(lat) < LEAD_BODY_HALF_M))[0]
             if len(inside):
                 k = inside[np.argmin(s[inside])]
@@ -716,6 +719,7 @@ class CarlaEnv:
     def _observe(self) -> Observation:
         image = self._last_image if self.render_images else None
         extras = self._extras()
+        extras["route_target"] = route_target(self._route, self._s, self.x, self.y, self.yaw)
         if self.render_images:
             extras["light_image"] = self._light_image
             extras["surround_images"] = self._surround_images
