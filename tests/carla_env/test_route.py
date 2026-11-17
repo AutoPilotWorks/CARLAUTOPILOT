@@ -149,6 +149,16 @@ def test_path_walkers_stand_on_the_lane_edge_or_cross_from_beyond_it():
     assert all(-2.5 <= p["lat"] <= -2.0 and abs(math.sin(p["heading"])) < 1e-9 for p in along)  # right edge outside the 1.3 m corridor, along the road
     for p in cross:  # starts beyond the lane and walks toward the other side
         assert abs(p["lat"]) > 4.0 and math.sin(p["heading"]) * p["lat"] < 0 and 25.0 <= p["trigger_m"] <= 40.0
+    # out along y = 0 to x = 150, back along y = 6.5 (the same street, the other way): a walker 4.25 m left of either
+    # pass would stand in the other pass's lane, so none may start within 3 m of the other pass
+    # 1 m points like CARLA's planner output (the s-window selects whole segments)
+    back = WindowedRoute([(float(x), 0.0) for x in range(151)] + [(150.0, 6.5)] + [(float(x), 6.5) for x in range(149, -1, -1)])
+    for p in path_walker_plan(back, random.Random(4), 40):
+        px, py = back.point_at(p["s"])
+        h = back.heading_at(p["s"])
+        x, y = px - p["lat"] * math.sin(h), py + p["lat"] * math.cos(h)
+        far = [back.project(x, y, a, b)[2] for a, b in ((0.0, p["s"] - 30.0), (p["s"] + 30.0, back.length)) if a < b]
+        assert min(far, default=99.0) >= 3.0
 
 
 def test_lead_brake_cars_start_ahead_slower_than_the_ego_and_brake_in_separate_windows():

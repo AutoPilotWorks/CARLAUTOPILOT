@@ -101,6 +101,7 @@ WALKER_HALT_MARGIN_M = 0.5
 # a walker held that long turns back, like a pedestrian stepping back for a car: held walkers and an ego waiting for
 # them deadlocked (Town03 radar probe 3 of 4 blocked, 11-17)
 WALKER_TURN_BACK_S = 4.0
+WALKER_STUCK_S = 10.0  # a scripted walker that has not moved this long while free to walk is removed
 LIGHT_MATCH_M = 2.0
 SETTLE_TICKS = 20
 WEATHERS = ("ClearNoon", "CloudyNoon", "WetNoon", "ClearSunset", "CloudySunset")
@@ -176,7 +177,7 @@ class CarlaEnv:
         lead_brakes: vehicles put ahead on the ego's route that brake hard now and then (route.lead_brake_plan).
         """
         self.path_walkers = path_walkers
-        self._path_walkers: list[list] = []  # [actor, plan, started, held since (s) or None]
+        self._path_walkers: list[list] = []  # [actor, plan, started, held since, last moved t, last moved location]
         self.lead_brakes = lead_brakes
         self._lead_brakes: list[list] = []  # [actor, plan, braking]
         self.extra_views = tuple(extra_views)
@@ -376,7 +377,7 @@ class CarlaEnv:
             w = self.world.try_spawn_actor(bp, carla.Transform(carla.Location(x=cx, y=cy, z=z + 1.0)))
             if w is not None:
                 self._actors.append(w)
-                self._path_walkers.append([w, plan, plan["mode"] == "along", None])
+                self._path_walkers.append([w, plan, plan["mode"] == "along", None, None, None])
 
     def _spawn_lead_brakes(self, rng: random.Random) -> None:
         """Traffic Manager cars on the ego's own route ahead (set_path, no lane changes, a slower desired speed), so the
@@ -417,25 +418,41 @@ class CarlaEnv:
     def _drive_path_walkers(self) -> None:
         """Scripted walkers keep their line but halt while their next few metres would enter the ego's footprint, so they
         never walk into a standing car (11-01 smoke). Only their own path counts: a walker halting for a car merely
-        beside its line (e.g. mid-crossing in front of it) deadlocked with the ego waiting for it (11-02 probe)."""
+        beside its line (e.g. mid-crossing in front of it) deadlocked with the ego waiting for it (11-02 probe).
+        Walkers along the road follow its bends at their planned lateral offset: walking straight from their start they
+        drifted into the lane on curves. One that has not moved for WALKER_STUCK_S without being held (caught on
+        something) is removed; one stood in the lane and the ego waited behind it to the end (Town02_Opt_100_001, 11-18)."""
         tr = self._ego.get_transform()
         f, r = tr.get_forward_vector(), tr.get_right_vector()
         ext = self._ego.bounding_box.extent
         hx, hy = ext.x + WALKER_HALT_MARGIN_M, ext.y + WALKER_HALT_MARGIN_M
+        gone = []
         for item in self._path_walkers:
-            w, plan, started, held_since = item
+            w, plan, started, held_since = item[:4]
             if not started and plan["s"] - self._s <= plan["trigger_m"]:
                 item[2] = started = True
             if started:
-                hp = plan["heading"]
-                dx, dy = math.cos(hp), -math.sin(hp)  # CARLA frame
                 loc = w.get_location()
+                hp = plan["heading"]
+                if plan["mode"] == "along":
+                    s, lat, _ = self._route.project(*carla_to_xy(loc.x, loc.y), plan.setdefault("s_now", plan["s"]) - 15.0, plan["s_now"] + 15.0)
+                    plan["s_now"] = s
+                    h = self._route.heading_at(s)
+                    sign = 1.0 if math.cos(plan["heading"] - h) >= 0.0 else -1.0
+                    pull = 0.5 * (plan["lat"] - lat)  # back toward the planned offset (left normal: -sin h, cos h)
+                    hp = math.atan2(sign * math.sin(h) + pull * math.cos(h), sign * math.cos(h) - pull * math.sin(h))
+                dx, dy = math.cos(hp), -math.sin(hp)  # CARLA frame
                 blocked = False
                 for d in np.arange(0.0, WALKER_HALT_LOOK_M + 1e-6, 0.5):
                     px, py = loc.x + dx * d - tr.location.x, loc.y + dy * d - tr.location.y
                     if abs(px * f.x + py * f.y) < hx and abs(px * r.x + py * r.y) < hy:
                         blocked = True
                         break
+                if blocked or item[5] is None or loc.distance(item[5]) > 0.5:
+                    item[4], item[5] = self.t, loc  # moving, or held on purpose
+                elif self.t - item[4] >= WALKER_STUCK_S:
+                    gone.append(item)
+                    continue
                 if not blocked:
                     item[3] = None
                 elif held_since is None:
@@ -445,6 +462,10 @@ class CarlaEnv:
                     item[3] = None
                     continue
                 w.apply_control(carla.WalkerControl(direction=carla.Vector3D(dx, dy, 0.0), speed=0.0 if blocked else plan["speed"]))
+        for item in gone:
+            self._path_walkers.remove(item)
+            self._actors.remove(item[0])
+            item[0].destroy()
 
     def _spawn_walkers(self, seed: int, n: int, ego_loc) -> None:
         if n <= 0:

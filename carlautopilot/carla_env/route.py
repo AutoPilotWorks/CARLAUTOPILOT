@@ -225,6 +225,7 @@ def lead_brake_plan(route: WindowedRoute, rng, n: int, max_time_s: float = 400.0
 # corridor (env.WALKER_BODY_HALF_M), so the expert passes instead of trailing them (11-02 probe: at 1.4 m they counted
 # as leads; 11-17: at 1.75 m inside a 1.8 m corridor the ego trailed one for 75 s)
 ALONG_LAT_M = (2.0, 2.5)
+CLEAR_OF_ROUTE_M = 3.0  # a walker's start this close to another part of the route stands in that part's lane
 
 
 def path_walker_plan(route: WindowedRoute, rng, n: int, lane_half_m: float = 1.75) -> list[dict]:
@@ -232,18 +233,28 @@ def path_walker_plan(route: WindowedRoute, rng, n: int, lane_half_m: float = 1.7
     saw in its data, where only 0.34% of frames had something within 8 m while moving). Half walk along the right lane
     edge just outside the in-path corridor (ALONG_LAT_M: the ego passes them close instead of trailing them at walking
     pace, 11-02 smoke), either way along the road; half cross the road ahead once the ego is within their trigger
-    distance. Positions are route s and lateral offset (left +); the env turns them into CARLA actors."""
+    distance. Positions are route s and lateral offset (left +); the env turns them into CARLA actors.
+    A spot within CLEAR_OF_ROUTE_M of another part of the route (beyond 30 m either way) is redrawn: a route that comes
+    back along the same street put a walker waiting to cross the second pass in the middle of the first pass's lane,
+    and the ego waited behind it to the end (Town02_Opt_100_001, 11-18)."""
     plans = []
     for k in range(n):
-        s = rng.uniform(40.0, max(41.0, route.length - 30.0))
-        h = route.heading_at(s)
+        for _ in range(20):
+            s = rng.uniform(40.0, max(41.0, route.length - 30.0))
+            h = route.heading_at(s)
+            lat = -rng.uniform(*ALONG_LAT_M) if k % 2 == 0 else rng.choice((-1.0, 1.0)) * (lane_half_m + 2.5)
+            px, py = route.point_at(s)
+            x, y = px - lat * math.sin(h), py + lat * math.cos(h)
+            windows = ([(0.0, s - 30.0)] if s > 30.0 else []) + ([(s + 30.0, route.length)] if s + 30.0 < route.length else [])
+            other = [route.project(x, y, a, b)[2] for a, b in windows]
+            if min(other, default=math.inf) >= CLEAR_OF_ROUTE_M:
+                break
         if k % 2 == 0:
-            # ponytail: a straight walk from s; on a curve the walker can drift into the lane (the ego then treats it as a lead)
-            lat = -rng.uniform(*ALONG_LAT_M)
+            # the env walks them along the road's bends at this offset (env._drive_path_walkers)
             back = rng.random() < 0.5
             plans.append({"mode": "along", "s": s, "lat": lat, "speed": rng.uniform(0.8, 1.5), "heading": h + (math.pi if back else 0.0), "trigger_m": math.inf})
         else:
-            side = rng.choice((-1.0, 1.0))
-            plans.append({"mode": "cross", "s": s, "lat": side * (lane_half_m + 2.5), "speed": rng.uniform(1.0, 1.8),
+            side = math.copysign(1.0, lat)
+            plans.append({"mode": "cross", "s": s, "lat": lat, "speed": rng.uniform(1.0, 1.8),
                           "heading": h + side * math.pi / 2.0 * -1.0, "trigger_m": rng.uniform(25.0, 40.0)})
     return plans
