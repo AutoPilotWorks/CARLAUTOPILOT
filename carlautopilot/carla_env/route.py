@@ -7,7 +7,7 @@ from collections.abc import Sequence
 
 import numpy as np
 
-from carlautopilot.core import Command
+from carlautopilot.core import Command, LeadInfo
 from carlautopilot.scenario import RouteCommand
 
 # agents.navigation.local_planner.RoadOption values
@@ -146,6 +146,30 @@ def radar_obstacle_mask(local: np.ndarray, mount_z: float, min_h: float = 0.3, m
     """Detections between min_h and max_h above the road: drops road-surface returns and overhead signs or bridges."""
     h = local[:, 2] + mount_z
     return (h > min_h) & (h < max_h)
+
+
+class RadarTrack:
+    """A radar obstacle counts once seen in `confirm` ticks in a row, then stays through up to `hold_s` of missed ticks
+    with its gap shrinking by our own travel (a rule; drops one-tick ghosts and bridges flicker)."""
+
+    def __init__(self, confirm: int = 2, hold_s: float = 0.3):
+        self.confirm, self.hold_s = confirm, hold_s
+        self.hits, self.age, self.last = 0, 0.0, None
+
+    def update(self, det: LeadInfo | None, speed_mps: float, dt: float) -> LeadInfo | None:
+        if det is not None:
+            self.hits += 1
+            if self.last is not None or self.hits >= self.confirm:
+                self.last, self.age = det, 0.0
+                return det
+            return None
+        self.hits = 0
+        if self.last is not None and self.age + dt <= self.hold_s + 1e-9:
+            self.age += dt
+            self.last = LeadInfo(distance_m=max(self.last.distance_m - speed_mps * dt, 0.0), rel_speed_mps=self.last.rel_speed_mps)
+            return self.last
+        self.last = None
+        return None
 
 
 def dedupe_points(points: Sequence[tuple[float, float]], min_step_m: float = 0.05) -> list[int]:

@@ -21,6 +21,7 @@ from carlautopilot.carla_env.route import (
     junction_turn_options,
     lead_brake_plan,
     path_walker_plan,
+    RadarTrack,
     radar_local,
     radar_obstacle_mask,
 )
@@ -55,9 +56,13 @@ FRONT_CAMERA = (1.5, 0.0, 1.6)  # x, y, z m in the vehicle frame
 # within 2 m of the body vs 120 deg (8.1 vs 16.8 m2 at pitch -20/-25).
 MULTICAM_SCALE = 4
 VIEW_SCALE = 2  # recovery views need no light crop: 2x + box-downscale renders 1/4 of 4x's pixels (4x: collection 2.6x slower, 11-02)
-# front radar in the bumper like a production ACC/AEB radar: x, z m in the vehicle frame, horizontal/vertical fov deg,
-# range m, points per second
-RADAR = (2.3, 0.6, 30.0, 10.0, 50.0, 3000)
+# front radars in the bumper like a production ACC/AEB set: a narrow long-range one and a wide short-range one (the
+# 30 deg radar alone covered only +-0.5 m at 2 m, so walkers close ahead went unseen, 11-02 probe). x, z m in the
+# vehicle frame, horizontal/vertical fov deg, range m, points per second
+RADARS = ((2.3, 0.6, 30.0, 10.0, 50.0, 6000), (2.4, 0.5, 90.0, 20.0, 30.0, 6000))
+RADAR_CONFIRM_TICKS = 2  # an obstacle counts once seen in this many ticks in a row (single-tick ghosts are dropped)
+RADAR_HOLD_S = 0.3  # a confirmed obstacle is kept this long through missed ticks, its gap shrinking with our speed
+RADAR_PREFILTER_M = 8.0  # ponytail: drops points this far beside the car before the per-point route projection; a tight curve can put the corridor further out at 30-50 m, widen or vectorize project() if those are missed
 LIGHT_CROP_DEG = (50.0, 18.0, 8.0)  # width, above and below the horizon: the truck light camera's view (50 deg, up 5)
 SURROUND_CAMERAS = {
     "left": (0.6, -1.05, 1.1, -90.0, -20.0, 150.0),
@@ -150,8 +155,9 @@ class CarlaEnv:
         STOP_SIGN event), and privileged extras gain next_stop_sign_distance_m and yield_distance_m (junction entry ahead
         while a vehicle/pedestrian is predicted, at constant velocity, to cross the ego's path inside the junction).
 
-        radar: a front RADAR sensor; extras["radar"] holds its raw detections and extras["radar_lead"] the nearest
-        detection above the road and inside the route corridor (a rule: the route is the planner's, not perception).
+        radar: front RADAR sensors (RADARS); extras["radar"] holds their raw detections and extras["radar_lead"] the
+        nearest detection above the road and inside the route corridor, confirmed over RADAR_CONFIRM_TICKS and held
+        RADAR_HOLD_S (rules: the route is the planner's, not perception).
 
         extra_views: recovery cameras, (offset left m, yaw left deg) from the front camera, rendered at VIEW_SCALE x and
         box-downscaled into privileged extras["view_images"] for collection; the expert labels them from that pose.
@@ -168,8 +174,9 @@ class CarlaEnv:
         self._view_images: list[np.ndarray] = []
         self.walker_cross = walker_cross
         self.radar = radar
-        self._radar_queue: queue.Queue | None = None
-        self._radar_points = np.zeros((0, 4), dtype=np.float32)
+        self._radars: list[tuple] = []  # (actor, queue, mount z)
+        self._radar_points: list[np.ndarray] = []
+        self._radar_track = RadarTrack(RADAR_CONFIRM_TICKS, RADAR_HOLD_S)
         self.radar_ms = 0.0
         self.lead_type: str | None = None
         self._surround_queues: dict[str, queue.Queue] = {}
@@ -287,16 +294,17 @@ class CarlaEnv:
             # CARLA y is right and yaw clockwise, the views are given left-positive
             self._view_queues = [self._camera(bpl, w * VIEW_SCALE, h * VIEW_SCALE, self.fov, carla.Transform(carla.Location(x=x, y=y - dy, z=z), carla.Rotation(yaw=-dyaw)))
                                  for dy, dyaw in self.extra_views]
-        self._radar_queue = None
-        if self.radar:
-            x, z, hfov, vfov, rng_m, pps = RADAR
+        self._radars = []
+        self._radar_track = RadarTrack(RADAR_CONFIRM_TICKS, RADAR_HOLD_S)
+        for x, z, hfov, vfov, rng_m, pps in RADARS if self.radar else ():
             bp = bpl.find("sensor.other.radar")
             for k, v in (("horizontal_fov", hfov), ("vertical_fov", vfov), ("range", rng_m), ("points_per_second", pps)):
                 bp.set_attribute(k, str(v))
-            self._radar_actor = self.world.spawn_actor(bp, carla.Transform(carla.Location(x=x, z=z)), attach_to=self._ego)
-            self._radar_queue = queue.Queue()
-            self._radar_actor.listen(self._radar_queue.put)
-            self._actors.append(self._radar_actor)
+            actor = self.world.spawn_actor(bp, carla.Transform(carla.Location(x=x, z=z)), attach_to=self._ego)
+            q = queue.Queue()
+            actor.listen(q.put)
+            self._actors.append(actor)
+            self._radars.append((actor, q, z))
         self._collisions: list = []
         col = self.world.spawn_actor(bpl.find("sensor.other.collision"), carla.Transform(), attach_to=self._ego)
         col.listen(self._collisions.append)
@@ -385,14 +393,15 @@ class CarlaEnv:
             self._lead_brakes.append([v, plan, False])
 
     def _drive_lead_brakes(self) -> None:
+        """The Traffic Manager keeps driving the car and only its desired speed drops to 0 in a brake window. Switching
+        autopilot off to brake did not hold: the car sped up to 50-60 km/h inside the window and, re-registered, lost
+        its desired speed and path; Town05_Opt_211_007 then aborted in world.tick (11-02, 11-17)."""
         for item in self._lead_brakes:
             v, plan, braking = item
             now = any(t0 <= self.t < t0 + d for t0, d in plan["brakes"])
             if now != braking:
-                v.set_autopilot(not now, self.tm_port)
+                self.tm.set_desired_speed(v, 0.0 if now else plan["speed_kmh"])
                 item[2] = now
-            if now:
-                v.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0))
 
     def _drive_path_walkers(self) -> None:
         """Scripted walkers keep their line but halt while the ego body is on that line just ahead of them, so they never
@@ -568,28 +577,28 @@ class CarlaEnv:
             self._last_image = box_downscale(front, MULTICAM_SCALE)
         self._surround_images = {n: self._read(q, frame) for n, q in self._surround_queues.items()}
         self._view_images = [box_downscale(self._read(q, frame), VIEW_SCALE) for q in self._view_queues]
-        if self._radar_queue is not None:
-            m = self._wait(self._radar_queue, frame)
-            self._radar_points = np.frombuffer(m.raw_data, dtype=np.float32).reshape(-1, 4).copy()
+        self._radar_points = [np.frombuffer(self._wait(q, frame).raw_data, dtype=np.float32).reshape(-1, 4).copy() for _, q, _ in self._radars]
 
     def _radar_lead(self) -> LeadInfo | None:
-        """Nearest radar detection above the road inside the route corridor ahead; closing speed from its Doppler
-        velocity (radial only: a pedestrian crossing straight across reads ~0)."""
+        """Nearest radar detection above the road inside the route corridor ahead, over all radars; closing speed from
+        its Doppler velocity (radial only: a pedestrian crossing straight across reads ~0). Points further than
+        RADAR_PREFILTER_M to the side of the car are dropped before the per-point route projection (speed)."""
         t0 = time.perf_counter()
-        pts = self._radar_points
-        local = radar_local(pts)
-        keep = radar_obstacle_mask(local, RADAR[1])
         best = None
-        if keep.any():
-            m = np.array(self._radar_actor.get_transform().get_matrix())
+        ego_half = self._ego.bounding_box.extent.x
+        for (actor, _, mount_z), pts in zip(self._radars, self._radar_points):
+            local = radar_local(pts)
+            keep = radar_obstacle_mask(local, mount_z) & (np.abs(local[:, 1]) < RADAR_PREFILTER_M)
+            if not keep.any():
+                continue
+            m = np.array(actor.get_transform().get_matrix())
             world = (m[:3, :3] @ local[keep].T).T + m[:3, 3]
-            ego_half = self._ego.bounding_box.extent.x
             for (wx, wy, _), vel in zip(world, pts[keep, 0]):
                 s, lat, _ = self._route.project(*carla_to_xy(wx, wy), self._s, self._s + LEAD_VISIBLE_M)
                 if s > self._s and abs(lat) < LEAD_BODY_HALF_M and (best is None or s - self._s - ego_half < best.distance_m):
                     best = LeadInfo(distance_m=max(s - self._s - ego_half, 0.0), rel_speed_mps=float(vel))
         self.radar_ms = (time.perf_counter() - t0) * 1000.0
-        return best
+        return self._radar_track.update(best, self.v, self.dt)
 
     def _follow(self, tr) -> None:
         back = tr.get_forward_vector()
@@ -683,7 +692,7 @@ class CarlaEnv:
             extras["light_image"] = self._light_image
             extras["surround_images"] = self._surround_images
         if self.radar:
-            extras["radar"] = self._radar_points
+            extras["radar"] = np.concatenate(self._radar_points) if self._radar_points else np.zeros((0, 4), dtype=np.float32)
             extras["radar_lead"] = self._radar_lead()
         return Observation(t=self.t, speed_mps=self.v, command=self._command(), image=image, lead=self._lead_info(), extras=extras)
 

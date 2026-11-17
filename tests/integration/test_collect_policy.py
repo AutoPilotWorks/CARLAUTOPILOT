@@ -156,6 +156,9 @@ def test_recovery_views_add_rows_labelled_to_steer_back(tmp_path):
     assert info["steps"] == 3 * (info["steps"] // 3) and a["view"][:3].tolist() == [0, 1, 2]
     centre, left, right = (a["steer"][a["view"] == k] for k in range(3))
     assert (left[2:] > centre[2:] + 0.01).all() and (right[2:] < centre[2:] - 0.01).all()  # seen from the left: steer right
+    pts = a["route_pts"]
+    assert pts.shape == (info["steps"], 8, 2)
+    assert np.allclose(pts[a["view"] == 1][:, :, 1], pts[a["view"] == 0][:, :, 1] - 1.0, atol=1e-5)  # camera 1 m left: route 1 m further right
 
 
 def test_expert_light_stop_sets_where_it_halts():

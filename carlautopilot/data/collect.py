@@ -74,7 +74,7 @@ def collect_episode(
     rng = np.random.default_rng(noise_seed)
     limit = max_steps if max_steps is not None else int(scenario.max_time_s / env.dt) + 10
     noise = 0.0
-    rows, images, target_speeds, percepts, lights, light_idx, views = [], [], [], [], [], [], []
+    rows, images, target_speeds, percepts, lights, light_idx, views, route_rows = [], [], [], [], [], [], [], []
     surround: dict[str, list[np.ndarray]] = {}  # the sedan rig's left/right/rear cameras, one image per step like light
     view_poses = getattr(env, "extra_views", ())
     labeler = copy.deepcopy(expert)  # steers the recovery views from their own pose; the expert's own state stays clean
@@ -88,13 +88,15 @@ def collect_episode(
                     surround.setdefault(name, []).append(img)
             # recovery views: the same step seen from a shifted/yawed camera, labelled with the expert's steer from that
             # pose (pedals, speed and perception labels are the front camera's); they share the step's light image
-            shots = [(obs.image, action.steer)] + [
-                (img, labeler.act(replace(obs, extras={**obs.extras, "lookahead_points": points_seen_from(obs.extras["lookahead_points"], dy, dyaw)})).clipped().steer)
-                for (dy, dyaw), img in zip(view_poses, obs.extras.get("view_images", ()))
-            ]
-            for k, (img, steer_label) in enumerate(shots):
+            pts = obs.extras.get("lookahead_points")
+            shots = [(obs.image, action.steer, pts)]
+            for (dy, dyaw), img in zip(view_poses, obs.extras.get("view_images", ())):
+                seen = points_seen_from(pts, dy, dyaw)
+                shots.append((img, labeler.act(replace(obs, extras={**obs.extras, "lookahead_points": seen})).clipped().steer, seen))
+            for k, (img, steer_label, route_pts) in enumerate(shots):
                 rows.append((obs.t, obs.speed_mps, int(obs.command), steer_label, action.throttle, action.brake))
                 images.append(img)
+                route_rows.append(route_pts)
                 target_speeds.append(getattr(expert, "last_target_speed", None))
                 percepts.append(percept_labels(obs))
                 light_idx.append(len(lights) - 1)
@@ -132,6 +134,8 @@ def collect_episode(
             arrays[k] = np.array(col, dtype=np.float32)
     if view_poses:
         arrays["view"] = np.array(views, dtype=np.int64)
+    if all(p is not None for p in route_rows):
+        arrays["route_pts"] = np.array(route_rows, dtype=np.float32)  # (rows, points, 2) in the row's camera frame
     step_images = {}
     if lights:
         arrays["light_idx"] = np.array(light_idx, dtype=np.int64)

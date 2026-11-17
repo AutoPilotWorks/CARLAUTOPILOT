@@ -94,6 +94,19 @@ def test_radar_points_turn_into_sensor_frame_and_drop_road_returns():
     assert radar_obstacle_mask(local, mount_z=0.6).tolist() == [True, True, False]  # 0.6 - 0.63 m: the road
 
 
+def test_radar_track_confirms_over_two_ticks_and_holds_through_short_gaps():
+    from carlautopilot.carla_env.route import RadarTrack
+    from carlautopilot.core import LeadInfo
+
+    tr = RadarTrack(confirm=2, hold_s=0.3)
+    d = LeadInfo(distance_m=10.0, rel_speed_mps=-2.0)
+    assert tr.update(d, 5.0, 0.05) is None  # one tick: could be a ghost
+    assert tr.update(d, 5.0, 0.05) == d
+    held = [tr.update(None, 5.0, 0.05) for _ in range(7)]
+    assert [round(h.distance_m, 2) for h in held[:6]] == [9.75, 9.5, 9.25, 9.0, 8.75, 8.5] and held[6] is None  # 0.3 s, then gone
+    assert tr.update(d, 5.0, 0.05) is None  # lost: confirm again
+
+
 def test_points_seen_from_a_camera_shifted_left_lie_to_its_right():
     from carlautopilot.carla_env.route import points_seen_from
 
