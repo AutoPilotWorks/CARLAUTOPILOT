@@ -62,7 +62,6 @@ VIEW_SCALE = 2  # recovery views need no light crop: 2x + box-downscale renders 
 RADARS = ((2.3, 0.6, 30.0, 10.0, 50.0, 6000), (2.4, 0.5, 90.0, 20.0, 30.0, 6000))
 RADAR_CONFIRM_TICKS = 2  # an obstacle counts once seen in this many ticks in a row (single-tick ghosts are dropped)
 RADAR_HOLD_S = 0.3  # a confirmed obstacle is kept this long through missed ticks, its gap shrinking with our speed
-RADAR_PREFILTER_M = 8.0  # ponytail: drops points this far beside the car before the per-point route projection; a tight curve can put the corridor further out at 30-50 m, widen or vectorize project() if those are missed
 LIGHT_CROP_DEG = (50.0, 18.0, 8.0)  # width, above and below the horizon: the truck light camera's view (50 deg, up 5)
 SURROUND_CAMERAS = {
     "left": (0.6, -1.05, 1.1, -90.0, -20.0, 150.0),
@@ -88,9 +87,19 @@ def light_crop(img: np.ndarray, fov_deg: float, crop: tuple[float, float, float]
 ROUTE_END_MARGIN_M = 2.0
 BLOCKED_SECONDS = 90.0  # CARLA reds at 4-way junctions can exceed 30 s
 CORRIDOR_HALF_M = 1.8
-LEAD_BODY_HALF_M = 1.3  # a body corner this close to the route centre line is in our path (sedan half width ~1.0)
-WALKER_HALT_M = 4.0  # scripted walkers stop while the ego centre is this close ahead on their line (sedan half length ~2.4)
-WALKER_HALT_SIDE_M = 1.2  # ... and this close to their line (sedan half width ~1.0 + walker)
+LEAD_BODY_HALF_M = 1.3  # a body outline this close to the route centre line is in our path (sedan half width ~1.0)
+# pedestrians get a wider corridor: one stopped 1.4-1.6 m beside the centre line (outline ~1.1-1.3 m) was passed at
+# 18 km/h and hit by the mirror side (Town03_Opt_100_000, 11-17). 1.8 m also caught the scripted walkers along the lane
+# edge and the ego trailed them; 1.5 m leaves ~0.45 m between the mirror and a passed walker.
+WALKER_BODY_HALF_M = 1.5
+# scripted walkers stop when their next WALKER_HALT_LOOK_M of path enters the ego footprint grown by
+# WALKER_HALT_MARGIN_M: one whose line passed 1.7 m from the ego centre walked into the standing car's front corner,
+# because the old rule treated the ego as its centre point (Town03_Opt_100_003, 11-17)
+WALKER_HALT_LOOK_M = 3.0
+WALKER_HALT_MARGIN_M = 0.5
+# a walker held that long turns back, like a pedestrian stepping back for a car: held walkers and an ego waiting for
+# them deadlocked (Town03 radar probe 3 of 4 blocked, 11-17)
+WALKER_TURN_BACK_S = 4.0
 LIGHT_MATCH_M = 2.0
 SETTLE_TICKS = 20
 WEATHERS = ("ClearNoon", "CloudyNoon", "WetNoon", "ClearSunset", "CloudySunset")
@@ -166,7 +175,7 @@ class CarlaEnv:
         lead_brakes: vehicles put ahead on the ego's route that brake hard now and then (route.lead_brake_plan).
         """
         self.path_walkers = path_walkers
-        self._path_walkers: list[list] = []  # [actor, plan, started]
+        self._path_walkers: list[list] = []  # [actor, plan, started, held since (s) or None]
         self.lead_brakes = lead_brakes
         self._lead_brakes: list[list] = []  # [actor, plan, braking]
         self.extra_views = tuple(extra_views)
@@ -179,6 +188,7 @@ class CarlaEnv:
         self._radar_track = RadarTrack(RADAR_CONFIRM_TICKS, RADAR_HOLD_S)
         self.radar_ms = 0.0
         self.lead_type: str | None = None
+        self.lead_id: int | None = None  # actor id of the simulator's lead (radar probes count catches per object)
         self._surround_queues: dict[str, queue.Queue] = {}
         self._surround_images: dict[str, np.ndarray] = {}
         self._light_image: np.ndarray | None = None
@@ -365,7 +375,7 @@ class CarlaEnv:
             w = self.world.try_spawn_actor(bp, carla.Transform(carla.Location(x=cx, y=cy, z=z + 1.0)))
             if w is not None:
                 self._actors.append(w)
-                self._path_walkers.append([w, plan, plan["mode"] == "along"])
+                self._path_walkers.append([w, plan, plan["mode"] == "along", None])
 
     def _spawn_lead_brakes(self, rng: random.Random) -> None:
         """Traffic Manager cars on the ego's own route ahead (set_path, no lane changes, a slower desired speed), so the
@@ -404,20 +414,35 @@ class CarlaEnv:
                 item[2] = now
 
     def _drive_path_walkers(self) -> None:
-        """Scripted walkers keep their line but halt while the ego body is on that line just ahead of them, so they never
-        walk into a standing car (11-01 smoke). Only on their line: a walker halting for a car beside its line (e.g.
-        mid-crossing in front of it) deadlocked with the ego waiting for it (11-02 radar probe, 3 of 4 blocked)."""
-        ego = self._ego.get_location()
+        """Scripted walkers keep their line but halt while their next few metres would enter the ego's footprint, so they
+        never walk into a standing car (11-01 smoke). Only their own path counts: a walker halting for a car merely
+        beside its line (e.g. mid-crossing in front of it) deadlocked with the ego waiting for it (11-02 probe)."""
+        tr = self._ego.get_transform()
+        f, r = tr.get_forward_vector(), tr.get_right_vector()
+        ext = self._ego.bounding_box.extent
+        hx, hy = ext.x + WALKER_HALT_MARGIN_M, ext.y + WALKER_HALT_MARGIN_M
         for item in self._path_walkers:
-            w, plan, started = item
+            w, plan, started, held_since = item
             if not started and plan["s"] - self._s <= plan["trigger_m"]:
                 item[2] = started = True
             if started:
                 hp = plan["heading"]
                 dx, dy = math.cos(hp), -math.sin(hp)  # CARLA frame
                 loc = w.get_location()
-                ex, ey = ego.x - loc.x, ego.y - loc.y
-                blocked = 0.0 < ex * dx + ey * dy < WALKER_HALT_M and abs(ex * dy - ey * dx) < WALKER_HALT_SIDE_M
+                blocked = False
+                for d in np.arange(0.0, WALKER_HALT_LOOK_M + 1e-6, 0.5):
+                    px, py = loc.x + dx * d - tr.location.x, loc.y + dy * d - tr.location.y
+                    if abs(px * f.x + py * f.y) < hx and abs(px * r.x + py * r.y) < hy:
+                        blocked = True
+                        break
+                if not blocked:
+                    item[3] = None
+                elif held_since is None:
+                    item[3] = self.t
+                elif self.t - held_since >= WALKER_TURN_BACK_S:
+                    plan["heading"] += math.pi
+                    item[3] = None
+                    continue
                 w.apply_control(carla.WalkerControl(direction=carla.Vector3D(dx, dy, 0.0), speed=0.0 if blocked else plan["speed"]))
 
     def _spawn_walkers(self, seed: int, n: int, ego_loc) -> None:
@@ -581,22 +606,24 @@ class CarlaEnv:
 
     def _radar_lead(self) -> LeadInfo | None:
         """Nearest radar detection above the road inside the route corridor ahead, over all radars; closing speed from
-        its Doppler velocity (radial only: a pedestrian crossing straight across reads ~0). Points further than
-        RADAR_PREFILTER_M to the side of the car are dropped before the per-point route projection (speed)."""
+        its Doppler velocity (radial only: a pedestrian crossing straight across reads ~0)."""
         t0 = time.perf_counter()
         best = None
         ego_half = self._ego.bounding_box.extent.x
         for (actor, _, mount_z), pts in zip(self._radars, self._radar_points):
             local = radar_local(pts)
-            keep = radar_obstacle_mask(local, mount_z) & (np.abs(local[:, 1]) < RADAR_PREFILTER_M)
+            keep = radar_obstacle_mask(local, mount_z)
             if not keep.any():
                 continue
             m = np.array(actor.get_transform().get_matrix())
             world = (m[:3, :3] @ local[keep].T).T + m[:3, 3]
-            for (wx, wy, _), vel in zip(world, pts[keep, 0]):
-                s, lat, _ = self._route.project(*carla_to_xy(wx, wy), self._s, self._s + LEAD_VISIBLE_M)
-                if s > self._s and abs(lat) < LEAD_BODY_HALF_M and (best is None or s - self._s - ego_half < best.distance_m):
-                    best = LeadInfo(distance_m=max(s - self._s - ego_half, 0.0), rel_speed_mps=float(vel))
+            s, lat = self._route.project_many(np.stack([world[:, 0], -world[:, 1]], axis=1), self._s, self._s + LEAD_VISIBLE_M)  # CARLA -> project frame
+            inside = np.nonzero((s > self._s) & (np.abs(lat) < LEAD_BODY_HALF_M))[0]
+            if len(inside):
+                k = inside[np.argmin(s[inside])]
+                gap = max(float(s[k]) - self._s - ego_half, 0.0)
+                if best is None or gap < best.distance_m:
+                    best = LeadInfo(distance_m=gap, rel_speed_mps=float(pts[keep, 0][k]))
         self.radar_ms = (time.perf_counter() - t0) * 1000.0
         return self._radar_track.update(best, self.v, self.dt)
 
@@ -634,7 +661,8 @@ class CarlaEnv:
             if math.hypot(ox - self.x, oy - self.y) > LEAD_VISIBLE_M + 10.0:
                 continue
             corners = [carla_to_xy(v.x, v.y) for v in a.bounding_box.get_world_vertices(a.get_transform())]
-            s = self._route.body_ahead(corners, self._s, self._s + LEAD_VISIBLE_M, LEAD_BODY_HALF_M)
+            half = WALKER_BODY_HALF_M if a.type_id.startswith("walker") else LEAD_BODY_HALF_M
+            s = self._route.body_ahead(corners, self._s, self._s + LEAD_VISIBLE_M, half)
             if s is None:
                 continue
             gap = s - self._s - ego_half
@@ -646,9 +674,9 @@ class CarlaEnv:
             along = vx * math.cos(h) + vy * math.sin(h)
             if best is None or gap < best.distance_m:
                 best = LeadInfo(distance_m=max(gap, 0.0), rel_speed_mps=along - self.v)
-                self.lead_type = a.type_id
+                self.lead_type, self.lead_id = a.type_id, a.id
         if best is None:
-            self.lead_type = None
+            self.lead_type = self.lead_id = None
         return best
 
     def _extras(self) -> dict:

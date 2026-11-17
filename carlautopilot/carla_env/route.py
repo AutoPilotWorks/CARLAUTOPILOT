@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections import deque
 from collections.abc import Sequence
 
 import numpy as np
@@ -107,6 +108,22 @@ class WindowedRoute:
         cross = self.seg_dir[i, 0] * rel[k, 1] - self.seg_dir[i, 1] * rel[k, 0]
         return float(self.cum[i] + t[k]), float(dist[k]) * (1.0 if cross >= 0 else -1.0), float(dist[k])
 
+    def project_many(self, xy: np.ndarray, s_min: float = -math.inf, s_max: float = math.inf) -> tuple[np.ndarray, np.ndarray]:
+        """project() for (N, 2) points at once -> (s, lateral left-positive); the radar's thousands of points per second
+        made the per-point loop the slow part (p99 8-10 ms, 11-17)."""
+        idx = np.nonzero((self.cum[1:] >= s_min) & (self.cum[:-1] <= s_max))[0]
+        if len(idx) == 0:
+            idx = np.arange(len(self.seg_len))
+        a, d, length = self.points[idx], self.seg_dir[idx], self.seg_len[idx]
+        rel = xy[:, None, :] - a[None]  # (N, M, 2)
+        t = np.clip(np.einsum("nmj,mj->nm", rel, d), 0.0, length)
+        off = rel - d[None] * t[..., None]
+        dist = np.hypot(off[..., 0], off[..., 1])
+        k = np.argmin(dist, axis=1)
+        n = np.arange(len(xy))
+        cross = d[k, 0] * rel[n, k, 1] - d[k, 1] * rel[n, k, 0]
+        return self.cum[idx][k] + t[n, k], dist[n, k] * np.where(cross >= 0, 1.0, -1.0)
+
     def point_at(self, s: float) -> tuple[float, float]:
         s = min(max(s, 0.0), self.length)
         i = int(min(np.searchsorted(self.cum, s, side="right") - 1, len(self.seg_len) - 1))
@@ -117,17 +134,22 @@ class WindowedRoute:
         i = int(min(max(np.searchsorted(self.cum, s, side="right") - 1, 0), len(self.seg_len) - 1))
         return math.atan2(self.seg_dir[i, 1], self.seg_dir[i, 0])
 
-    def body_ahead(self, corners: Sequence[tuple[float, float]], s0: float, s_max: float, half_m: float) -> float | None:
-        """Smallest route position of a body's footprint corners that lies ahead of s0 and within half_m of the route.
-        Corners, not the centre: a bus turning off the route can have its centre beside the lane while its tail still
-        blocks it (Town03_Opt_111_022 drove into one, 2026-10-31). A body wider than the corridor (bus, fire truck) centred
-        on the route has every corner outside it, so corners on both sides of the corridor block it too (11-02: the
-        expert drove into 11 of 40 Town01 routes)."""
-        pts = [(s, lat) for s, lat, _ in (self.project(x, y, s0, s_max) for x, y in corners) if s > s0]
-        ahead = [s for s, lat in pts if abs(lat) < half_m]
-        if not ahead and pts and min(lat for _, lat in pts) <= -half_m and max(lat for _, lat in pts) >= half_m:
-            ahead = [s for s, _ in pts]
-        return min(ahead, default=None)
+    def body_ahead(self, corners: Sequence[tuple[float, float]], s0: float, s_max: float, half_m: float, step_m: float = 0.25) -> float | None:
+        """Smallest route position, ahead of s0, at which a body's footprint outline lies within half_m of the route.
+        The outline, not the centre: a bus turning off the route can have its centre beside the lane while its tail
+        still blocks it (Town03_Opt_111_022, 2026-10-31). Not the corners alone either: a body wider than the corridor
+        centred on it has every corner outside (11-02: the expert drove into 11 of 40 Town01 routes), and taking the
+        nearest corner of such a body put the gap at a corner far to the side, short of where it blocks (11-17)."""
+        p = np.unique(np.round(np.asarray(corners, dtype=float), 3), axis=0)  # get_world_vertices: 8 corners, 4 in plan
+        c = p.mean(axis=0)
+        p = p[np.argsort(np.arctan2(p[:, 1] - c[1], p[:, 0] - c[0]))]
+        edges = []
+        for a, b in zip(p, np.roll(p, -1, axis=0)):
+            k = max(int(np.ceil(np.hypot(*(b - a)) / step_m)), 1)
+            edges.append(a + (b - a) * np.linspace(0.0, 1.0, k, endpoint=False)[:, None])
+        s, lat = self.project_many(np.concatenate(edges), s0, s_max)
+        ahead = s[(s > s0) & (np.abs(lat) < half_m)]
+        return float(ahead.min()) if len(ahead) else None
 
 
 def points_seen_from(points: Sequence[tuple[float, float]], dy_m: float, dyaw_deg: float) -> list[tuple[float, float]]:
@@ -149,21 +171,22 @@ def radar_obstacle_mask(local: np.ndarray, mount_z: float, min_h: float = 0.3, m
 
 
 class RadarTrack:
-    """A radar obstacle counts once seen in `confirm` ticks in a row, then stays through up to `hold_s` of missed ticks
-    with its gap shrinking by our own travel (a rule; drops one-tick ghosts and bridges flicker)."""
+    """A radar obstacle counts once seen in `confirm` of the last `window` ticks, then stays through up to `hold_s` of
+    missed ticks with its gap shrinking by our own travel (a rule; drops one-tick ghosts and bridges flicker). Two in a
+    row was too strict for sparse far returns: 15-20 m vehicles fell from 82% raw to 58% tracked (Town10HD, 11-17)."""
 
-    def __init__(self, confirm: int = 2, hold_s: float = 0.3):
+    def __init__(self, confirm: int = 2, hold_s: float = 0.3, window: int = 3):
         self.confirm, self.hold_s = confirm, hold_s
-        self.hits, self.age, self.last = 0, 0.0, None
+        self.recent: deque[bool] = deque(maxlen=window)
+        self.age, self.last = 0.0, None
 
     def update(self, det: LeadInfo | None, speed_mps: float, dt: float) -> LeadInfo | None:
+        self.recent.append(det is not None)
         if det is not None:
-            self.hits += 1
-            if self.last is not None or self.hits >= self.confirm:
+            if self.last is not None or sum(self.recent) >= self.confirm:
                 self.last, self.age = det, 0.0
                 return det
             return None
-        self.hits = 0
         if self.last is not None and self.age + dt <= self.hold_s + 1e-9:
             self.age += dt
             self.last = LeadInfo(distance_m=max(self.last.distance_m - speed_mps * dt, 0.0), rel_speed_mps=self.last.rel_speed_mps)
@@ -198,7 +221,10 @@ def lead_brake_plan(route: WindowedRoute, rng, n: int, max_time_s: float = 400.0
     return plans
 
 
-ALONG_LAT_M = (1.75, 2.5)  # along walkers' distance right of the route centre: their nearest body corner (~0.35 m) stays past the 1.3 m in-path corridor, so the expert passes instead of trailing them (11-02 probe: at 1.4 m they still counted as leads)
+# along walkers' distance right of the route centre: their body outline (~0.35 m) stays past the 1.5 m pedestrian
+# corridor (env.WALKER_BODY_HALF_M), so the expert passes instead of trailing them (11-02 probe: at 1.4 m they counted
+# as leads; 11-17: at 1.75 m inside a 1.8 m corridor the ego trailed one for 75 s)
+ALONG_LAT_M = (2.0, 2.5)
 
 
 def path_walker_plan(route: WindowedRoute, rng, n: int, lane_half_m: float = 1.75) -> list[dict]:

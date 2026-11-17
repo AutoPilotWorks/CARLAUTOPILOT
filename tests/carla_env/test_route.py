@@ -79,6 +79,12 @@ def test_body_ahead_sees_a_tail_in_the_lane_when_the_centre_is_beside_it():
     box = lambda cy, hw: [(20 + sx * 5.14, cy + sy * hw) for sx in (-1, 1) for sy in (-1, 1)]
     assert r.body_ahead(box(0.0, 1.97), 5.0, 45.0, 1.3) == pytest.approx(14.86)  # 3.9 m wide bus centred: every corner outside
     assert r.body_ahead(box(3.5, 1.97), 5.0, 45.0, 1.3) is None  # same bus one lane over
+    # 4 m square turned 45 deg, nearest corner 2.5 m beside the route at s 17.2: it blocks where its edge comes within
+    # 1.3 m, at s ~18.4 (the nearest corner said 17.2, the corner inside said 20.0)
+    d = 4.0 / math.sqrt(2)
+    diamond = [(20 - d, 2.5), (20, 2.5 + d), (20 + d, 2.5), (20, 2.5 - d)]
+    assert r.body_ahead(diamond, 5.0, 45.0, 1.3) == pytest.approx(20 - d + 1.2, abs=0.2)
+    assert r.body_ahead(diamond + diamond, 5.0, 45.0, 1.3) == pytest.approx(20 - d + 1.2, abs=0.2)  # CARLA gives 8 3-D corners
 
 
 def test_radar_points_turn_into_sensor_frame_and_drop_road_returns():
@@ -105,6 +111,20 @@ def test_radar_track_confirms_over_two_ticks_and_holds_through_short_gaps():
     held = [tr.update(None, 5.0, 0.05) for _ in range(7)]
     assert [round(h.distance_m, 2) for h in held[:6]] == [9.75, 9.5, 9.25, 9.0, 8.75, 8.5] and held[6] is None  # 0.3 s, then gone
     assert tr.update(d, 5.0, 0.05) is None  # lost: confirm again
+    tr = RadarTrack(confirm=2, hold_s=0.3)
+    assert tr.update(d, 5.0, 0.05) is None and tr.update(None, 5.0, 0.05) is None
+    assert tr.update(d, 5.0, 0.05) == d  # 2 of the last 3 ticks: a sparse far return still confirms
+
+
+def test_project_many_matches_project():
+    import numpy as np
+
+    r = WindowedRoute([(0, 0), (20, 0), (30, 10), (30, 40)])
+    xy = np.random.default_rng(1).uniform(-5, 40, (50, 2))
+    s, lat = r.project_many(xy, 5.0, 35.0)
+    for (x, y), si, li in zip(xy, s, lat):
+        s1, l1, _ = r.project(x, y, 5.0, 35.0)
+        assert si == pytest.approx(s1) and li == pytest.approx(l1)
 
 
 def test_points_seen_from_a_camera_shifted_left_lie_to_its_right():
@@ -126,7 +146,7 @@ def test_path_walkers_stand_on_the_lane_edge_or_cross_from_beyond_it():
     cross = [p for p in plans if p["mode"] == "cross"]
     assert len(along) == len(cross) == 20
     assert all(40.0 <= p["s"] <= 270.0 for p in plans)
-    assert all(-2.5 <= p["lat"] <= -1.75 and abs(math.sin(p["heading"])) < 1e-9 for p in along)  # right edge outside the 1.3 m corridor, along the road
+    assert all(-2.5 <= p["lat"] <= -2.0 and abs(math.sin(p["heading"])) < 1e-9 for p in along)  # right edge outside the 1.3 m corridor, along the road
     for p in cross:  # starts beyond the lane and walks toward the other side
         assert abs(p["lat"]) > 4.0 and math.sin(p["heading"]) * p["lat"] < 0 and 25.0 <= p["trigger_m"] <= 40.0
 
