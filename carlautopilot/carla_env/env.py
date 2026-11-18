@@ -14,6 +14,7 @@ import numpy as np
 from carlautopilot.carla_env.route import (
     LANE_CHANGE_OPTIONS,
     WindowedRoute,
+    behind_in_lane,
     carla_to_xy,
     carla_yaw_to_rad,
     commands_from_options,
@@ -180,6 +181,7 @@ class CarlaEnv:
         self._path_walkers: list[list] = []  # [actor, plan, started, held since, last moved t, last moved location]
         self.lead_brakes = lead_brakes
         self._lead_brakes: list[list] = []  # [actor, plan, braking]
+        self._lane_held: set[int] = set()  # NPC ids whose lane changes _hold_lanes_behind switched off
         self.extra_views = tuple(extra_views)
         self._view_queues: list[queue.Queue] = []
         self._view_images: list[np.ndarray] = []
@@ -414,6 +416,23 @@ class CarlaEnv:
             if now != braking:
                 self.tm.set_desired_speed(v, 0.0 if now else plan["speed_kmh"])
                 item[2] = now
+
+    def _hold_lanes_behind(self) -> None:
+        """Every 0.5 s: Traffic Manager cars right behind the ego (route.behind_in_lane) may not change lanes; others
+        may again (lead-brake cars never do)."""
+        if not self._npcs or round(self.t / self.dt) % 10:
+            return
+        e = self._ego.get_transform()
+        f, r = e.get_forward_vector(), e.get_right_vector()
+        fixed = {item[0].id for item in self._lead_brakes}
+        for v in self.world.get_actors(self._npcs):
+            if v.id in fixed:
+                continue
+            d = v.get_location() - e.location
+            hold = behind_in_lane(d.x * f.x + d.y * f.y, d.x * r.x + d.y * r.y)
+            if hold != (v.id in self._lane_held):
+                self.tm.auto_lane_change(v, not hold)
+                (self._lane_held.add if hold else self._lane_held.discard)(v.id)
 
     def _drive_path_walkers(self) -> None:
         """Scripted walkers keep their line but halt while their next few metres would enter the ego's footprint, so they
@@ -764,6 +783,7 @@ class CarlaEnv:
         prev_s = self._s
         self._drive_path_walkers()
         self._drive_lead_brakes()
+        self._hold_lanes_behind()
         self._tick()
         self.t += self.dt
         self._update_pose()
@@ -812,6 +832,7 @@ class CarlaEnv:
         if self._npcs:
             self.client.apply_batch_sync([carla.command.DestroyActor(i) for i in self._npcs], True)
             self._npcs = []
+        self._lane_held.clear()
         for a in reversed(self._actors):
             if a.type_id.startswith(("sensor.", "controller.")):
                 a.stop()

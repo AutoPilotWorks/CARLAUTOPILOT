@@ -3,7 +3,15 @@ import math
 import pytest
 
 from carlautopilot.carla_env.route import WindowedRoute, carla_to_xy, carla_yaw_to_rad, commands_from_options, dedupe_points, junction_turn_options
+from carlautopilot.carla_env.route import behind_in_lane
 from carlautopilot.core import Command
+
+
+def test_behind_in_lane_is_the_ego_lane_up_to_15_m_back():
+    assert behind_in_lane(-3.0, 0.4) and behind_in_lane(-14.9, -1.9)
+    assert not behind_in_lane(2.0, 0.0)  # ahead
+    assert not behind_in_lane(-16.0, 0.0)  # too far back
+    assert not behind_in_lane(-5.0, 3.5)  # next lane
 
 
 def test_carla_frame_flips_y_and_yaw():

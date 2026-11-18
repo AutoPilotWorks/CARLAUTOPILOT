@@ -221,6 +221,17 @@ def lead_brake_plan(route: WindowedRoute, rng, n: int, max_time_s: float = 400.0
     return plans
 
 
+# a Traffic Manager car this close behind the ego in its lane may not change lanes: pulling out from ~3 m behind in
+# stop-and-go traffic, NPCs stopped treating the ego as their leader, sped up to 17-20 km/h and clipped its rear
+# corner (sedan_v2.3L Town10HD_Opt_233_002, reproduced with gaps default/2.5 m/speed-linked, 11-18)
+NO_LANE_CHANGE_BEHIND_M = (15.0, 2.0)  # metres behind the ego, metres either side of its centre line
+
+
+def behind_in_lane(fwd_m: float, right_m: float, zone: tuple[float, float] = NO_LANE_CHANGE_BEHIND_M) -> bool:
+    """A car at (fwd_m, right_m) in the ego frame is right behind the ego in its lane."""
+    return -zone[0] < fwd_m < 0.0 and abs(right_m) < zone[1]
+
+
 # along walkers' distance right of the route centre: their body outline (~0.35 m) stays past the 1.5 m pedestrian
 # corridor (env.WALKER_BODY_HALF_M), so the expert passes instead of trailing them (11-02 probe: at 1.4 m they counted
 # as leads; 11-17: at 1.75 m inside a 1.8 m corridor the ego trailed one for 75 s)
